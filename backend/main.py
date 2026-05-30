@@ -15,22 +15,17 @@ from fastapi.staticfiles import StaticFiles
 from .config import ANTHROPIC_API_KEY, CLAUDE_MODEL, DATA_BUNDLE_DIR, SIM_CACHE_DIR, SIM_STEP_MIN
 from .copilot import suggest
 from .data_loader import (
-    PRESETS,
     load_cache,
     load_flights,
     load_sectors,
-    load_wx_strips,
     save_cache,
     list_snapshots,
 )
-from .disruptions import apply_disruption, reset_disruption
 from .mitigations import apply_mitigation
 from .schemas import (
     CopilotApplyRequest,
     CopilotApplyResponse,
     CopilotSuggestResponse,
-    DisruptRequest,
-    DisruptResponse,
     FrameResponse,
     HealthResponse,
     Mitigation,
@@ -139,7 +134,8 @@ def health():
 @app.get("/api/scenarios", response_model=ScenariosResponse)
 def get_scenarios():
     snapshots = list_snapshots(DATA_BUNDLE_DIR)
-    return ScenariosResponse(snapshots=snapshots, presets=PRESETS)
+    # No injected disruptions in this build — we solve the dataset's own over-demand.
+    return ScenariosResponse(snapshots=snapshots, presets=[])
 
 
 # ── Scenario load ──────────────────────────────────────────────────────────────
@@ -169,13 +165,11 @@ def scenario_load(body: ScenarioLoadRequest):
     t_end = _parse_t(window_end_iso) if t_end_iso is None else _parse_t(t_end_iso)
     t_end = min(t_end, t_end_candidate)
 
-    wx_strips = load_wx_strips(snapshot_id, DATA_BUNDLE_DIR)
-
     state = build_scenario(
         snapshot_id=snapshot_id,
         flights=flights,
         sectors=sectors,
-        wx_strips=wx_strips,
+        wx_strips=[],            # weather not used in the over-demand-only build
         t_start=t_start,
         t_end=t_end,
         cached_visits=cached_visits,
@@ -184,6 +178,10 @@ def scenario_load(body: ScenarioLoadRequest):
     if cached_visits is None:
         log.info("Saving sector visit cache for snapshot %s", snapshot_id)
         save_cache(snapshot_id, (state.visits_by_flight, t_start.isoformat(), t_end.isoformat()))
+
+    # The dataset's natural over-demand IS the problem set — freeze it now as the
+    # "do nothing" baseline so the timeline can overlay baseline vs AI-managed.
+    freeze_baseline(state)
 
     _scenarios[state.scenario_id] = state
 
@@ -222,34 +220,6 @@ def get_frame(scenario_id: str, t: str, band: str | None = None):
 def get_timeline(scenario_id: str, band: str | None = None):
     state = _get_scenario(scenario_id)
     return compute_timeline(state, band)
-
-
-# ── Disrupt ────────────────────────────────────────────────────────────────────
-
-@app.post("/api/scenario/{scenario_id}/disrupt", response_model=DisruptResponse)
-def post_disrupt(scenario_id: str, body: DisruptRequest, band: str | None = None):
-    state = _get_scenario(scenario_id)
-
-    # Reset any previous disruption
-    reset_disruption(state)
-    state.applied = []
-    state.pending_mitigation = None
-    state.total_delay_min = 0.0
-
-    try:
-        disruption_info, storm_polygon = apply_disruption(state, body.model_dump(exclude_none=True))
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    # Freeze the "do nothing" baseline (all bands) right after the disruption
-    freeze_baseline(state)
-    timeline = compute_timeline(state, band)
-
-    return DisruptResponse(
-        disruption=disruption_info,
-        timeline=timeline,
-        storm_polygon=storm_polygon,
-    )
 
 
 # ── Co-pilot suggest ───────────────────────────────────────────────────────────
@@ -302,37 +272,27 @@ def post_copilot_apply(scenario_id: str, body: CopilotApplyRequest, band: str | 
 
 @app.post("/api/scenario/{scenario_id}/reset", response_model=ResetResponse)
 def post_reset(scenario_id: str, body: ResetRequest, band: str | None = None):
+    """Drop all applied mitigations and restore the dataset's natural baseline."""
     state = _get_scenario(scenario_id)
 
-    # Reload fresh flights (to undo all flight mutations)
+    # Reload fresh flights (to undo all flight mutations from applied mitigations)
     sectors = _get_sectors()
-    flights, window_start_iso, window_end_iso = load_flights(state.snapshot_id, DATA_BUNDLE_DIR)
-    wx_strips = load_wx_strips(state.snapshot_id, DATA_BUNDLE_DIR)
+    flights, _, _ = load_flights(state.snapshot_id, DATA_BUNDLE_DIR)
 
     cached = load_cache(state.snapshot_id)
     cached_visits = cached[0] if cached else None
-
-    from datetime import timedelta
-    t_start = state.t_start
-    t_end = state.t_end
 
     new_state = build_scenario(
         snapshot_id=state.snapshot_id,
         flights=flights,
         sectors=sectors,
-        wx_strips=wx_strips,
-        t_start=t_start,
-        t_end=t_end,
+        wx_strips=[],
+        t_start=state.t_start,
+        t_end=state.t_end,
         cached_visits=cached_visits,
     )
     new_state.scenario_id = state.scenario_id  # keep the same ID
-
-    if body.keep_disruption and state.disruption:
-        try:
-            apply_disruption(new_state, state.disruption)
-            freeze_baseline(new_state)
-        except Exception as e:
-            log.warning("Could not re-apply disruption on reset: %s", e)
+    freeze_baseline(new_state)
 
     _scenarios[state.scenario_id] = new_state
     timeline = compute_timeline(new_state, band)

@@ -14,7 +14,7 @@ LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 VISIT_SAMPLE_MIN: int = 2          # sample interval when building sector visit timelines
 SIM_STEP_MIN: int = 5              # frame step exposed to the UI
 SIM_CACHE_DIR: Path = Path(".sim_cache")
-MAX_COPILOT_ROUNDS: int = 8        # max tool-use rounds per suggest call
+MAX_COPILOT_ROUNDS: int = 5        # max tool-use rounds per suggest call
 
 # Weather conflict thresholds (per data spec)
 REFC_THRESHOLD_DBZ: float = 40.0

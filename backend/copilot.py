@@ -21,20 +21,36 @@ log = logging.getLogger(__name__)
 # ── System prompt (cached prefix) ──────────────────────────────────────────────
 
 _SYSTEM_PROMPT = """You are the AI co-pilot in an air-traffic flow-management war room.
-A disruption has put sectors over capacity and pushed flights into weather.
+Several sectors of the National Airspace are OVER CAPACITY — more flights are routed
+through them at once than their capacity allows (over-demand).
 
-Your job: propose the SINGLE most valuable next mitigation to relieve the worst conflict,
-with the least delay and distance added, creating no new conflicts.
+Your job: propose the SINGLE most valuable next mitigation that FULLY CLEARS an
+over-demand sector (brings it back to capacity), with the least delay and distance
+added, creating no new over-demand.
+
+Levers available (all evaluated against real sector occupancy):
+- REROUTE a contributing flight laterally so it transits a less-loaded sector.
+- DELAY a contributing flight so it enters the busy sector at a calmer time.
+- ALTITUDE: move a flight to the other band (HIGH/LOW) to shift it out of the sector.
+
+Strategy — this matters:
+- A single fix moves ONE flight, so it can only clear a sector that is just 1–2 flights
+  over capacity. PREFER these "winnable" sectors (e.g. 21/20) — one good fix clears them
+  and visibly drops the conflict count.
+- Use `list_conflicts` to see how far over each sector is. Pick a sector that is barely
+  over, find a contributing flight, and evaluate fixes until one shows conflicts_resolved >= 1
+  and conflicts_created == 0.
+- Don't waste the turn on a sector that is many flights over (e.g. 26/20) — one fix won't
+  clear it and the impact will read 0.
 
 Rules:
-- Prefer rerouting or altitude changes for weather conflicts.
-- Prefer ground holds (DELAY) for over-demand when rerouting is unavailable.
 - Always evaluate a candidate fix with the what-if tools before recommending it.
+- Recommend the fix with conflicts_resolved >= 1 and the least added delay/distance.
 - Return ONLY ONE mitigation — the best single fix.
 - The operator will call you again for the next fix after applying yours.
 
 Respond by calling the `recommend` tool with the chosen mitigation and a concise,
-plain-language rationale that mentions the specific flight and sector."""
+plain-language rationale that names the specific flight and the sector it relieves."""
 
 # ── Tool definitions ────────────────────────────────────────────────────────────
 
@@ -207,26 +223,37 @@ def _exec_tool(name: str, inp: dict, state: ScenarioState, mid_t) -> Any:
 
 # ── World summary builder ───────────────────────────────────────────────────────
 
+def _winnable_targets(state: ScenarioState, k: int = 5) -> list[dict]:
+    """The k over-demand sectors closest to capacity (most likely clearable by one
+    fix), each with peak occupancy, capacity, and a few contributing flights."""
+    from .simulation import build_occupancy
+    grid = build_occupancy(state)
+    rows = []
+    for sname, occ in grid.items():
+        cap = state.sectors[sname].capacity
+        peak = max(occ)
+        if peak > cap:
+            rows.append((peak - cap, sname, peak, cap))
+    rows.sort(key=lambda r: r[0])  # smallest overage first
+    out = []
+    for overage, sname, peak, cap in rows[:k]:
+        flights = list(dict.fromkeys(v.flight_id for v in state.visits_by_sector.get(sname, [])))[:4]
+        out.append({"sector": sname, "peak": peak, "capacity": cap,
+                    "over_by": overage, "contributing_flights": flights})
+    return out
+
+
 def _build_world_summary(state: ScenarioState) -> str:
-    from datetime import timedelta
-    mid_t = state.t_start + (state.t_end - state.t_start) / 2
-    frame = compute_frame(state, mid_t)
-    od = frame.metrics.over_demand_sectors
-    wx = frame.metrics.weather_flights
-    cl = frame.metrics.closed_flights
-    top = frame.conflicts[:5]
-    parts = []
-    if od:
-        parts.append(f"{od} sector(s) over capacity")
-    if wx:
-        parts.append(f"{wx} flight(s) in weather")
-    if cl:
-        parts.append(f"{cl} flight(s) in closed sectors")
-    if not parts:
-        return "All clear — no conflicts detected."
-    summary = "; ".join(parts) + "."
-    if top:
-        summary += " Top conflicts: " + ", ".join(c.label for c in top[:3]) + "."
+    from .simulation import overdemand_keyset
+    od = len({s for _, s in overdemand_keyset(state)})
+    if od == 0:
+        return "All clear — no sectors over capacity."
+    targets = _winnable_targets(state, 3)
+    summary = f"{od} sector(s) over capacity."
+    if targets:
+        summary += " Closest to capacity: " + ", ".join(
+            f"{t['sector']} {t['peak']}/{t['capacity']}" for t in targets
+        ) + "."
     return summary
 
 
@@ -252,16 +279,26 @@ def _claude_suggest(state: ScenarioState) -> CopilotSuggestResponse:
         }
     ]
 
+    targets = _winnable_targets(state, 5)
+    targets_json = json.dumps(targets, indent=2)
     user_content = (
         f"Current conflict snapshot:\n{world_summary}\n\n"
-        f"Simulation time window: {state.t_start.isoformat()} to {state.t_end.isoformat()}.\n"
-        f"Analyse the conflicts, evaluate candidate fixes, and call `recommend` with the best single mitigation."
+        f"The most winnable over-demand sectors (closest to capacity) and their contributing "
+        f"flights are below. Start here — these can usually be cleared by moving ONE flight:\n"
+        f"{targets_json}\n\n"
+        f"Pick one target, evaluate at most 2-3 candidate fixes on its contributing flights "
+        f"(use the evaluate_* tools), then call `recommend` AS SOON AS you find one with "
+        f"conflicts_resolved >= 1 and conflicts_created == 0. Do not keep exploring — converge quickly."
     )
 
     messages = [{"role": "user", "content": user_content}]
 
     log.info("Calling Claude co-pilot (%s)…", CLAUDE_MODEL)
     recommended: dict | None = None
+    # Track the best fix Claude actually evaluated, so its work isn't wasted if it
+    # never gets around to calling `recommend`.
+    best_eval: tuple[dict, str, dict] | None = None  # (impact_dict, action, tool_input)
+    _ACTION_BY_TOOL = {"evaluate_reroute": "REROUTE", "evaluate_delay": "DELAY", "evaluate_altitude": "ALTITUDE"}
 
     for round_num in range(MAX_COPILOT_ROUNDS):
         response = client.messages.create(
@@ -294,7 +331,21 @@ def _claude_suggest(state: ScenarioState) -> CopilotSuggestResponse:
                 })
                 break
 
-            result = _exec_tool(tool_name, tool_input, state, mid_t)
+            try:
+                result = _exec_tool(tool_name, tool_input, state, mid_t)
+            except Exception as e:
+                # Feed the error back to Claude so it can retry (e.g. with a valid
+                # flight_id) instead of aborting the whole session.
+                result = {"error": str(e)}
+
+            # Remember the best winning evaluation seen
+            if tool_name in _ACTION_BY_TOOL and isinstance(result, dict) and "conflicts_resolved" in result:
+                if result["conflicts_resolved"] >= 1 and result["conflicts_created"] == 0:
+                    if best_eval is None or (
+                        result["conflicts_resolved"], -result["delay_min"]
+                    ) > (best_eval[0]["conflicts_resolved"], -best_eval[0]["delay_min"]):
+                        best_eval = (result, _ACTION_BY_TOOL[tool_name], tool_input)
+
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,
@@ -311,8 +362,22 @@ def _claude_suggest(state: ScenarioState) -> CopilotSuggestResponse:
             break
 
     if recommended is None:
-        log.warning("Claude did not call recommend — falling back")
-        return _fallback_suggest(state)
+        if best_eval is not None:
+            # Claude never called recommend, but it found a valid winning fix —
+            # promote that rather than discarding its work.
+            impact_dict, action, tinput = best_eval
+            log.info("Claude didn't call recommend; promoting its best evaluated fix (%s)", action)
+            recommended = {
+                "action": action,
+                "flight_id": tinput["flight_id"],
+                "params": {k: v for k, v in tinput.items() if k != "flight_id"},
+                "rationale": f"{action.title()} {tinput['flight_id'].split('|')[0]} to relieve the "
+                             f"targeted over-demand sector — clears "
+                             f"{impact_dict['conflicts_resolved']} sector(s) with no new over-demand.",
+            }
+        else:
+            log.warning("Claude did not call recommend and found no winning fix — falling back")
+            return _fallback_suggest(state)
 
     # Build the Mitigation from Claude's recommend call
     action = recommended["action"]

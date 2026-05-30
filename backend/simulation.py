@@ -10,9 +10,9 @@ import numpy as np
 from shapely.geometry import Point
 from shapely.strtree import STRtree
 
-from .config import REFC_THRESHOLD_DBZ, SIM_STEP_MIN, VISIT_SAMPLE_MIN
+from .config import SIM_STEP_MIN, VISIT_SAMPLE_MIN
 from .data_loader import Flight, Sector, WxStrip, build_strtrees
-from .geo import cum_dist_nm, interpolate_position, latlon_to_pixel
+from .geo import cum_dist_nm, interpolate_position
 from .schemas import (
     ConflictFrame,
     FlightFrame,
@@ -157,6 +157,7 @@ class ScenarioState:
     baseline_timeline: dict[str, list[TimelineFrameCount]] = field(default_factory=dict)
     baseline_frames: list[str] = field(default_factory=list)
     total_delay_min: float = 0.0
+    occupancy_cache: dict[str, list[int]] | None = field(default=None, repr=False)
 
 
 def build_scenario(
@@ -224,6 +225,9 @@ def rebuild_flight(state: ScenarioState, flight: Flight) -> None:
     for v in new_visits:
         state.visits_by_sector.setdefault(v.sector_name, []).append(v)
 
+    # Occupancy changed → invalidate the cached grid
+    state.occupancy_cache = None
+
 
 # ── Weather lookup ──────────────────────────────────────────────────────────────
 
@@ -247,8 +251,10 @@ def _snap_t(t: datetime, t_start: datetime, step_min: int = SIM_STEP_MIN) -> dat
 
 
 def compute_frame(state: ScenarioState, t: datetime, band: str | None = None) -> FrameResponse:
+    """World state at time `t`. This build detects OVER_DEMAND only — the natural
+    sector-capacity conflicts present in the dataset. No injected disruptions,
+    no weather, no closed sectors."""
     t = _snap_t(t, state.t_start)
-    wx_strip = get_wx_strip(state.wx_strips, t)
 
     # Sector occupancy (optionally restricted to one altitude band)
     sector_counts: dict[str, list[str]] = {}  # sector_name -> [flight_ids]
@@ -261,11 +267,8 @@ def compute_frame(state: ScenarioState, t: datetime, band: str | None = None) ->
         if fids:
             sector_counts[sname] = fids
 
-    # Flight statuses
+    # Flight positions (all status "ok" — no weather/closure in this build)
     flight_frames: list[FlightFrame] = []
-    weather_flight_ids: set[str] = set()
-    closed_flight_ids: set[str] = set()
-
     for fid, flight in state.flights.items():
         if band is not None and flight.band != band:
             continue
@@ -273,24 +276,6 @@ def compute_frame(state: ScenarioState, t: datetime, band: str | None = None) ->
         if pos is None:
             continue
         lat, lon = pos
-
-        status = "ok"
-        # Weather check
-        if wx_strip is not None:
-            i, j = latlon_to_pixel(lat, lon)
-            refc_val = wx_strip.refc()[i, j]
-            retop_val = wx_strip.retop()[i, j]
-            if refc_val >= REFC_THRESHOLD_DBZ and retop_val >= flight.cruise_alt_ft:
-                status = "weather"
-                weather_flight_ids.add(fid)
-
-        # Closed-sector check
-        for visit in state.visits_by_flight.get(fid, []):
-            if visit.enter_t <= t < visit.exit_t and visit.sector_name in state.closed_sectors:
-                status = "closed"
-                closed_flight_ids.add(fid)
-                break
-
         flight_frames.append(FlightFrame(
             id=fid,
             fn=flight.flight_number,
@@ -298,7 +283,7 @@ def compute_frame(state: ScenarioState, t: datetime, band: str | None = None) ->
             lon=round(lon, 5),
             band=flight.band,
             alt_ft=flight.cruise_alt_ft,
-            status=status,
+            status="ok",
         ))
 
     # Sector frames + over-demand conflicts
@@ -313,13 +298,12 @@ def compute_frame(state: ScenarioState, t: datetime, band: str | None = None) ->
         count = len(fids)
         cap = sector.capacity
         ratio = count / cap if cap > 0 else 0.0
-        closed = sname in state.closed_sectors
         sector_frames.append(SectorFrame(
             name=sname,
             count=count,
             capacity=cap,
             ratio=round(ratio, 3),
-            closed=closed,
+            closed=False,
         ))
         if count > cap:
             conflicts.append(ConflictFrame(
@@ -332,59 +316,13 @@ def compute_frame(state: ScenarioState, t: datetime, band: str | None = None) ->
             ))
             conflict_idx += 1
 
-    # Closed-sector conflicts
-    for sname in state.closed_sectors:
-        if band is not None:
-            sector = state.sectors.get(sname)
-            if sector is None or sector.band != band:
-                continue
-        in_closed = [fid for fid in closed_flight_ids
-                     if any(v.sector_name == sname and v.enter_t <= t < v.exit_t
-                            for v in state.visits_by_flight.get(fid, []))]
-        if in_closed:
-            sector = state.sectors.get(sname)
-            cap = sector.capacity if sector else 0
-            # Add to sector frames if not already there
-            existing = [sf for sf in sector_frames if sf.name == sname]
-            if not existing:
-                sector_frames.append(SectorFrame(
-                    name=sname,
-                    count=len(in_closed),
-                    capacity=cap,
-                    ratio=0.0,
-                    closed=True,
-                ))
-            conflicts.append(ConflictFrame(
-                id=f"c{conflict_idx}",
-                kind="CLOSED_SECTOR",
-                severity=1.0,
-                sector_name=sname,
-                flight_ids=in_closed,
-                label=f"{sname} closed ({len(in_closed)} flights inside)",
-            ))
-            conflict_idx += 1
-
-    # Weather conflicts
-    if weather_flight_ids:
-        conflicts.append(ConflictFrame(
-            id=f"c{conflict_idx}",
-            kind="WEATHER",
-            severity=1.0,
-            sector_name=None,
-            flight_ids=list(weather_flight_ids),
-            label=f"{len(weather_flight_ids)} flight(s) in storm",
-        ))
-
-    # Sort conflicts: over-demand first by severity, then closed, then weather
-    conflicts.sort(key=lambda c: (
-        {"OVER_DEMAND": 0, "CLOSED_SECTOR": 1, "WEATHER": 2}[c.kind],
-        -c.severity,
-    ))
+    # Worst (most over capacity) first
+    conflicts.sort(key=lambda c: -c.severity)
 
     metrics = MetricsFrame(
-        over_demand_sectors=sum(1 for c in conflicts if c.kind == "OVER_DEMAND"),
-        weather_flights=len(weather_flight_ids),
-        closed_flights=len(closed_flight_ids),
+        over_demand_sectors=len(conflicts),
+        weather_flights=0,
+        closed_flights=0,
         total_delay_min=state.total_delay_min,
         airborne=len(flight_frames),
     )
@@ -445,11 +383,125 @@ def compute_timeline(state: ScenarioState, band: str | None = None) -> TimelineR
 def freeze_baseline(state: ScenarioState) -> None:
     """Snapshot the current timeline as the "do nothing" baseline, per band.
 
-    Call once right after a disruption is applied (before any mitigations), so the
-    UI can overlay baseline vs AI-managed for whichever band it is viewing.
+    Call once before any mitigations are applied (at load), so the UI can overlay
+    baseline vs AI-managed for whichever band it is viewing.
     """
     for band in (None, "HIGH", "LOW"):
         tl = compute_timeline(state, band)
         state.baseline_timeline[band or "ALL"] = tl.current
         if band is None:
             state.baseline_frames = tl.frames
+
+
+# ── Over-demand keyset (for measuring mitigation impact) ─────────────────────────
+
+def _frame_times(state: ScenarioState) -> list[datetime]:
+    out: list[datetime] = []
+    t = state.t_start
+    while t <= state.t_end:
+        out.append(t)
+        t += timedelta(minutes=SIM_STEP_MIN)
+    return out
+
+
+def overdemand_keyset(state: ScenarioState) -> set[tuple[int, str]]:
+    """Set of (frame_index, sector_name) where the sector is over capacity, across
+    the whole timeline. Diffing two keysets gives the true conflicts resolved/created
+    of a candidate fix — not just at one sampled instant.
+
+    Built by walking each sector's visit intervals once (O(total visits)), so it is
+    cheap enough to call before/after every what-if evaluation.
+    """
+    frames = _frame_times(state)
+    n = len(frames)
+    if n == 0:
+        return set()
+    step = timedelta(minutes=SIM_STEP_MIN)
+
+    grid = build_occupancy(state)
+    keys: set[tuple[int, str]] = set()
+    for sname, occ in grid.items():
+        cap = state.sectors[sname].capacity
+        for i, c in enumerate(occ):
+            if c > cap:
+                keys.add((i, sname))
+    return keys
+
+
+def _visit_frame_span(state: ScenarioState, v: "SectorVisit", n: int, step_s: float) -> tuple[int, int]:
+    """Frame index range [lo, hi] a visit covers (enter_t <= t < exit_t)."""
+    import math
+    d_enter = (v.enter_t - state.t_start).total_seconds() / step_s
+    d_exit = (v.exit_t - state.t_start).total_seconds() / step_s
+    lo = max(0, math.ceil(d_enter))
+    hi = min(n - 1, math.ceil(d_exit) - 1)
+    return lo, hi
+
+
+def build_occupancy(state: ScenarioState) -> dict[str, list[int]]:
+    """Per-sector occupancy count at each frame, over the whole timeline.
+
+    O(total visits). Cached on the state and invalidated whenever a flight's
+    visits change, so what-if evaluations can diff against it cheaply.
+    """
+    if state.occupancy_cache is not None:
+        return state.occupancy_cache
+    frames = _frame_times(state)
+    n = len(frames)
+    step_s = float(SIM_STEP_MIN * 60)
+    grid: dict[str, list[int]] = {}
+    for sname, visit_list in state.visits_by_sector.items():
+        if sname not in state.sectors or not visit_list:
+            continue
+        occ = [0] * n
+        for v in visit_list:
+            lo, hi = _visit_frame_span(state, v, n, step_s)
+            for i in range(lo, hi + 1):
+                occ[i] += 1
+        grid[sname] = occ
+    state.occupancy_cache = grid
+    return grid
+
+
+def impact_of_change(
+    state: ScenarioState,
+    flight_id: str,
+    new_visits: list["SectorVisit"],
+) -> tuple[int, int]:
+    """(sectors_resolved, sectors_created) if `flight_id` switched from its current
+    visits to `new_visits`. Recomputes only the sectors the flight enters/leaves —
+    no state mutation, no full-timeline rescan."""
+    grid = build_occupancy(state)
+    n = len(next(iter(grid.values()))) if grid else len(_frame_times(state))
+    step_s = float(SIM_STEP_MIN * 60)
+
+    old_visits = state.visits_by_flight.get(flight_id, [])
+    affected = {v.sector_name for v in old_visits} | {v.sector_name for v in new_visits}
+
+    resolved = created = 0
+    for sname in affected:
+        sector = state.sectors.get(sname)
+        if sector is None:
+            continue
+        cap = sector.capacity
+        base = grid.get(sname, [0] * n)
+        was_over = any(c > cap for c in base)
+
+        after = list(base)
+        for v in old_visits:
+            if v.sector_name == sname:
+                lo, hi = _visit_frame_span(state, v, n, step_s)
+                for i in range(lo, hi + 1):
+                    after[i] -= 1
+        for v in new_visits:
+            if v.sector_name == sname:
+                lo, hi = _visit_frame_span(state, v, n, step_s)
+                for i in range(lo, hi + 1):
+                    after[i] += 1
+        now_over = any(c > cap for c in after)
+
+        if was_over and not now_over:
+            resolved += 1
+        elif not was_over and now_over:
+            created += 1
+    return resolved, created

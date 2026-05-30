@@ -1,7 +1,12 @@
-"""Reroute / delay / altitude mitigations: evaluate (what-if) and apply."""
+"""Reroute / delay / altitude mitigations: evaluate (what-if) and apply.
+
+Each mitigation moves a single flight. `evaluate_*` builds a candidate flight,
+computes its new sector visits WITHOUT touching shared state, and measures impact
+via the incremental `impact_of_change` (only the sectors the flight enters/leaves are
+re-checked). `apply_*` commits the change with `rebuild_flight`.
+"""
 from __future__ import annotations
 
-import copy
 import logging
 import uuid
 from datetime import timedelta
@@ -9,38 +14,21 @@ from datetime import timedelta
 import numpy as np
 
 from .config import REROUTE_OFFSET_DEG
+from .data_loader import Flight
+from .geo import cum_dist_nm
 from .schemas import Mitigation, MitigationImpact
-from .simulation import ScenarioState, compute_frame, rebuild_flight
+from .simulation import (
+    ScenarioState,
+    build_sector_visits,
+    build_trajectory,
+    impact_of_change,
+    rebuild_flight,
+)
 
 log = logging.getLogger(__name__)
 
 
-# ── Conflict snapshot helpers ───────────────────────────────────────────────────
-
-def _conflict_key_set(state: ScenarioState) -> set[tuple]:
-    """Snapshot all current conflicts as a set of (kind, sector_or_flight) tuples."""
-    from .simulation import compute_frame
-    from datetime import timedelta
-    # Use peak-ish time for diffing
-    mid_t = state.t_start + (state.t_end - state.t_start) / 2
-    frame = compute_frame(state, mid_t)
-    keys: set[tuple] = set()
-    for c in frame.conflicts:
-        if c.sector_name:
-            keys.add((c.kind, c.sector_name))
-        else:
-            for fid in c.flight_ids:
-                keys.add((c.kind, fid))
-    return keys
-
-
-def _diff_impacts(before: set[tuple], after: set[tuple]) -> tuple[int, int]:
-    resolved = len(before - after)
-    created = len(after - before)
-    return resolved, created
-
-
-# ── REROUTE ────────────────────────────────────────────────────────────────────
+# ── Candidate builders (no state mutation) ──────────────────────────────────────
 
 def _offset_waypoints(
     lats: np.ndarray,
@@ -49,14 +37,13 @@ def _offset_waypoints(
     around: list[str],
     sectors: dict,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Shift waypoints that fall inside the `around` sectors laterally."""
+    """Shift the waypoints that fall in/near the `around` sectors laterally."""
     from shapely.geometry import Point
 
     new_lats = lats.copy()
     new_lons = lons.copy()
 
-    lat_off = 0.0
-    lon_off = 0.0
+    lat_off = lon_off = 0.0
     if side == "north":
         lat_off = REROUTE_OFFSET_DEG
     elif side == "south":
@@ -68,7 +55,6 @@ def _offset_waypoints(
 
     around_geoms = [sectors[n].geom for n in around if n in sectors]
     if not around_geoms:
-        # Offset all waypoints if sectors not found
         return lats + lat_off, lons + lon_off
 
     for idx, (lat, lon) in enumerate(zip(lats, lons)):
@@ -78,210 +64,101 @@ def _offset_waypoints(
                 new_lats[idx] = lat + lat_off
                 new_lons[idx] = lon + lon_off
                 break
-
     return new_lats, new_lons
 
 
-def evaluate_reroute(
-    state: ScenarioState,
-    flight_id: str,
-    side: str,
-    around: list[str],
-) -> tuple[MitigationImpact, dict]:
-    """What-if reroute. Returns (impact, params_dict). Does NOT commit."""
-    flight = state.flights.get(flight_id)
-    if flight is None:
-        raise ValueError(f"Flight {flight_id} not found")
-
-    before = _conflict_key_set(state)
-
-    # Clone and mutate
+def _reroute_candidate(state: ScenarioState, flight: Flight, side: str, around: list[str]) -> tuple[Flight, float, float]:
     new_flight = flight.clone()
     new_lats, new_lons = _offset_waypoints(flight.lats, flight.lons, side, around, state.sectors)
     new_flight.lats = new_lats
     new_flight.lons = new_lons
-
-    # Compute new timing from extra distance
-    from .geo import cum_dist_nm
-    old_cum = cum_dist_nm(flight.lats, flight.lons)
-    new_cum = cum_dist_nm(new_lats, new_lons)
-    extra_nm = float(new_cum[-1] - old_cum[-1])
-    if flight.cruise_speed_kt > 0:
-        delay_min = (extra_nm / flight.cruise_speed_kt) * 60
-    else:
-        delay_min = 0.0
+    extra_nm = float(cum_dist_nm(new_lats, new_lons)[-1] - cum_dist_nm(flight.lats, flight.lons)[-1])
+    delay_min = (extra_nm / flight.cruise_speed_kt) * 60 if flight.cruise_speed_kt > 0 else 0.0
     new_flight.t1 = flight.t1 + timedelta(minutes=delay_min)
+    return new_flight, round(extra_nm, 1), round(delay_min, 1)
 
-    # Temporarily rebuild to measure impact
-    original_visits = copy.deepcopy(state.visits_by_flight.get(flight_id, []))
-    rebuild_flight(state, new_flight)
-    after = _conflict_key_set(state)
-    resolved, created = _diff_impacts(before, after)
 
-    # Restore original flight
-    old_flight_copy = flight.clone()
-    rebuild_flight(state, old_flight_copy)
-    state.visits_by_flight[flight_id] = original_visits
-    # Patch visits_by_sector back
-    for visits in state.visits_by_sector.values():
-        for v in visits:
-            pass  # already handled by rebuild_flight restoring
+def _delay_candidate(flight: Flight, minutes: float) -> tuple[Flight, float, float]:
+    new_flight = flight.clone()
+    new_flight.t0 = flight.t0 + timedelta(minutes=minutes)
+    new_flight.t1 = flight.t1 + timedelta(minutes=minutes)
+    return new_flight, 0.0, round(minutes, 1)
 
-    return (
-        MitigationImpact(
-            conflicts_resolved=resolved,
-            conflicts_created=created,
-            delay_min=round(delay_min, 1),
-            extra_nm=round(extra_nm, 1),
-        ),
-        {"side": side, "around": around},
+
+def _altitude_candidate(flight: Flight, new_alt_ft: int) -> tuple[Flight, float, float]:
+    new_flight = flight.clone()
+    new_flight.cruise_alt_ft = new_alt_ft
+    new_flight.band = "HIGH" if new_alt_ft >= 35000 else "LOW"
+    return new_flight, 0.0, 0.0
+
+
+def _measure(state: ScenarioState, flight_id: str, candidate: Flight, extra_nm: float, delay_min: float) -> MitigationImpact:
+    """Impact of switching `flight_id` to `candidate`, without mutating state."""
+    new_traj = build_trajectory(candidate)
+    new_visits = build_sector_visits(candidate, new_traj, state.strtrees, state.sectors)
+    resolved, created = impact_of_change(state, flight_id, new_visits)
+    return MitigationImpact(
+        conflicts_resolved=resolved,
+        conflicts_created=created,
+        delay_min=delay_min,
+        extra_nm=extra_nm,
     )
+
+
+# ── REROUTE ────────────────────────────────────────────────────────────────────
+
+def evaluate_reroute(state: ScenarioState, flight_id: str, side: str, around: list[str]) -> tuple[MitigationImpact, dict]:
+    flight = state.flights.get(flight_id)
+    if flight is None:
+        raise ValueError(f"Flight {flight_id} not found")
+    cand, extra_nm, delay_min = _reroute_candidate(state, flight, side, around)
+    return _measure(state, flight_id, cand, extra_nm, delay_min), {"side": side, "around": around}
 
 
 def apply_reroute(state: ScenarioState, flight_id: str, side: str, around: list[str]) -> MitigationImpact:
     flight = state.flights[flight_id]
-    before = _conflict_key_set(state)
-
-    new_flight = flight.clone()
-    new_lats, new_lons = _offset_waypoints(flight.lats, flight.lons, side, around, state.sectors)
-    new_flight.lats = new_lats
-    new_flight.lons = new_lons
-
-    from .geo import cum_dist_nm
-    old_cum = cum_dist_nm(flight.lats, flight.lons)
-    new_cum = cum_dist_nm(new_lats, new_lons)
-    extra_nm = float(new_cum[-1] - old_cum[-1])
-    delay_min = (extra_nm / flight.cruise_speed_kt) * 60 if flight.cruise_speed_kt > 0 else 0.0
-    new_flight.t1 = flight.t1 + timedelta(minutes=delay_min)
-
-    rebuild_flight(state, new_flight)
-    after = _conflict_key_set(state)
-    resolved, created = _diff_impacts(before, after)
+    cand, extra_nm, delay_min = _reroute_candidate(state, flight, side, around)
+    impact = _measure(state, flight_id, cand, extra_nm, delay_min)
+    rebuild_flight(state, cand)
     state.total_delay_min += delay_min
-
-    return MitigationImpact(
-        conflicts_resolved=resolved,
-        conflicts_created=created,
-        delay_min=round(delay_min, 1),
-        extra_nm=round(extra_nm, 1),
-    )
+    return impact
 
 
 # ── DELAY ──────────────────────────────────────────────────────────────────────
 
-def evaluate_delay(
-    state: ScenarioState,
-    flight_id: str,
-    minutes: float,
-) -> tuple[MitigationImpact, dict]:
+def evaluate_delay(state: ScenarioState, flight_id: str, minutes: float) -> tuple[MitigationImpact, dict]:
     flight = state.flights.get(flight_id)
     if flight is None:
         raise ValueError(f"Flight {flight_id} not found")
-
-    before = _conflict_key_set(state)
-
-    new_flight = flight.clone()
-    new_flight.t0 = flight.t0 + timedelta(minutes=minutes)
-    new_flight.t1 = flight.t1 + timedelta(minutes=minutes)
-
-    original_visits = copy.deepcopy(state.visits_by_flight.get(flight_id, []))
-    rebuild_flight(state, new_flight)
-    after = _conflict_key_set(state)
-    resolved, created = _diff_impacts(before, after)
-
-    # Restore
-    old_flight_copy = flight.clone()
-    rebuild_flight(state, old_flight_copy)
-    state.visits_by_flight[flight_id] = original_visits
-
-    return (
-        MitigationImpact(
-            conflicts_resolved=resolved,
-            conflicts_created=created,
-            delay_min=round(minutes, 1),
-            extra_nm=0.0,
-        ),
-        {"minutes": minutes},
-    )
+    cand, extra_nm, delay_min = _delay_candidate(flight, minutes)
+    return _measure(state, flight_id, cand, extra_nm, delay_min), {"minutes": minutes}
 
 
 def apply_delay(state: ScenarioState, flight_id: str, minutes: float) -> MitigationImpact:
     flight = state.flights[flight_id]
-    before = _conflict_key_set(state)
-
-    new_flight = flight.clone()
-    new_flight.t0 = flight.t0 + timedelta(minutes=minutes)
-    new_flight.t1 = flight.t1 + timedelta(minutes=minutes)
-
-    rebuild_flight(state, new_flight)
-    after = _conflict_key_set(state)
-    resolved, created = _diff_impacts(before, after)
-    state.total_delay_min += minutes
-
-    return MitigationImpact(
-        conflicts_resolved=resolved,
-        conflicts_created=created,
-        delay_min=round(minutes, 1),
-        extra_nm=0.0,
-    )
+    cand, extra_nm, delay_min = _delay_candidate(flight, minutes)
+    impact = _measure(state, flight_id, cand, extra_nm, delay_min)
+    rebuild_flight(state, cand)
+    state.total_delay_min += delay_min
+    return impact
 
 
 # ── ALTITUDE ───────────────────────────────────────────────────────────────────
 
-def evaluate_altitude(
-    state: ScenarioState,
-    flight_id: str,
-    new_alt_ft: int,
-) -> tuple[MitigationImpact, dict]:
+def evaluate_altitude(state: ScenarioState, flight_id: str, new_alt_ft: int) -> tuple[MitigationImpact, dict]:
     flight = state.flights.get(flight_id)
     if flight is None:
         raise ValueError(f"Flight {flight_id} not found")
-
-    before = _conflict_key_set(state)
-
-    new_flight = flight.clone()
-    new_flight.cruise_alt_ft = new_alt_ft
-    new_flight.band = "HIGH" if new_alt_ft >= 35000 else "LOW"
-
-    original_visits = copy.deepcopy(state.visits_by_flight.get(flight_id, []))
-    rebuild_flight(state, new_flight)
-    after = _conflict_key_set(state)
-    resolved, created = _diff_impacts(before, after)
-
-    # Restore
-    old_flight_copy = flight.clone()
-    rebuild_flight(state, old_flight_copy)
-    state.visits_by_flight[flight_id] = original_visits
-
-    return (
-        MitigationImpact(
-            conflicts_resolved=resolved,
-            conflicts_created=created,
-            delay_min=0.0,
-            extra_nm=0.0,
-        ),
-        {"new_alt_ft": new_alt_ft},
-    )
+    cand, extra_nm, delay_min = _altitude_candidate(flight, new_alt_ft)
+    return _measure(state, flight_id, cand, extra_nm, delay_min), {"new_alt_ft": new_alt_ft}
 
 
 def apply_altitude(state: ScenarioState, flight_id: str, new_alt_ft: int) -> MitigationImpact:
     flight = state.flights[flight_id]
-    before = _conflict_key_set(state)
-
-    new_flight = flight.clone()
-    new_flight.cruise_alt_ft = new_alt_ft
-    new_flight.band = "HIGH" if new_alt_ft >= 35000 else "LOW"
-
-    rebuild_flight(state, new_flight)
-    after = _conflict_key_set(state)
-    resolved, created = _diff_impacts(before, after)
-
-    return MitigationImpact(
-        conflicts_resolved=resolved,
-        conflicts_created=created,
-        delay_min=0.0,
-        extra_nm=0.0,
-    )
+    cand, extra_nm, delay_min = _altitude_candidate(flight, new_alt_ft)
+    impact = _measure(state, flight_id, cand, extra_nm, delay_min)
+    rebuild_flight(state, cand)
+    return impact
 
 
 # ── Dispatch ────────────────────────────────────────────────────────────────────
@@ -302,78 +179,87 @@ def apply_mitigation(state: ScenarioState, mit: Mitigation) -> MitigationImpact:
 # ── Deterministic solver (fallback) ────────────────────────────────────────────
 
 def deterministic_best(state: ScenarioState) -> Mitigation | None:
-    """Pick the worst conflict, try the three what-ifs, return the best."""
-    from .simulation import compute_frame
-    mid_t = state.t_start + (state.t_end - state.t_start) / 2
-    frame = compute_frame(state, mid_t)
-    if not frame.conflicts:
+    """Target the most "winnable" over-demand sector (closest to capacity) and try
+    fixes on its contributing flights until one fully clears it. This mirrors the
+    strategy the Claude prompt uses, so the fallback is just as effective."""
+    from .simulation import build_occupancy
+
+    # Rank over-demand sectors across the WHOLE timeline by overage (closest to
+    # capacity first — those are the ones a single fix can fully clear).
+    grid = build_occupancy(state)
+    targets: list[tuple[str, int]] = []   # (sector_name, peak_overage)
+    for sname, occ in grid.items():
+        cap = state.sectors[sname].capacity
+        overage = max(occ) - cap
+        if overage > 0:
+            targets.append((sname, overage))
+    if not targets:
+        return None
+    targets.sort(key=lambda x: x[1])
+
+    best: tuple[MitigationImpact, str, dict, str] | None = None  # (impact, action, params, flight_id)
+
+    for sname, _overage in targets[:12]:
+        around = [sname]
+        # Flights that transit this sector are the contributors
+        contributing = list(dict.fromkeys(v.flight_id for v in state.visits_by_sector.get(sname, [])))
+        for flight_id in contributing[:6]:
+            flight = state.flights.get(flight_id)
+            if flight is None:
+                continue
+            trials: list[tuple[MitigationImpact, str, dict]] = []
+            for side in ("north", "south", "east", "west"):
+                try:
+                    imp, p = evaluate_reroute(state, flight_id, side, around)
+                    trials.append((imp, "REROUTE", p))
+                except Exception:
+                    pass
+            try:
+                imp, p = evaluate_delay(state, flight_id, 30.0)
+                trials.append((imp, "DELAY", p))
+            except Exception:
+                pass
+            new_alt = flight.cruise_alt_ft + (2000 if flight.cruise_alt_ft < 35000 else 4000)
+            try:
+                imp, p = evaluate_altitude(state, flight_id, new_alt)
+                trials.append((imp, "ALTITUDE", p))
+            except Exception:
+                pass
+
+            # Best trial for this flight: maximize cleared, no new over-demand, least delay
+            for imp, action, params in trials:
+                if imp.conflicts_created > 0:
+                    continue
+                key = (imp.conflicts_resolved, -imp.delay_min, -imp.extra_nm)
+                if imp.conflicts_resolved >= 1 and (
+                    best is None or key > (best[0].conflicts_resolved, -best[0].delay_min, -best[0].extra_nm)
+                ):
+                    best = (imp, action, params, flight_id)
+            # A clean win on this sector — take it
+            if best is not None and best[0].conflicts_resolved >= 1:
+                break
+        if best is not None and best[0].conflicts_resolved >= 1:
+            break
+
+    if best is None:
         return None
 
-    # Find worst over-demand or closed-sector conflict
-    worst = max(frame.conflicts, key=lambda c: c.severity)
-    if not worst.flight_ids:
-        return None
-
-    # Pick the most frequently conflicted flight
-    flight_id = worst.flight_ids[0]
-    flight = state.flights.get(flight_id)
-    if flight is None:
-        return None
-
-    candidates: list[tuple[MitigationImpact, str, dict]] = []
-
-    around = [worst.sector_name] if worst.sector_name else []
-
-    try:
-        impact, params = evaluate_reroute(state, flight_id, "north", around)
-        candidates.append((impact, "REROUTE", params))
-    except Exception:
-        pass
-
-    try:
-        impact, params = evaluate_delay(state, flight_id, 30.0)
-        candidates.append((impact, "DELAY", params))
-    except Exception:
-        pass
-
-    if flight.cruise_alt_ft < 40000:
-        try:
-            impact, params = evaluate_altitude(state, flight_id, flight.cruise_alt_ft + 2000)
-            candidates.append((impact, "ALTITUDE", params))
-        except Exception:
-            pass
-
-    if not candidates:
-        # Default: 30-min delay
-        return Mitigation(
-            id="m_" + uuid.uuid4().hex[:6],
-            action="DELAY",
-            flight_id=flight_id,
-            flight_number=flight.flight_number,
-            params={"minutes": 30},
-            impact=MitigationImpact(conflicts_resolved=0, conflicts_created=0, delay_min=30, extra_nm=0),
-            rationale=f"Hold {flight.flight_number} 30 min to relieve {worst.label}.",
-        )
-
-    # Pick best by conflicts resolved, then fewest delay minutes
-    best_impact, best_action, best_params = max(
-        candidates,
-        key=lambda x: (x[0].conflicts_resolved, -x[0].delay_min),
-    )
-
-    action_label = {"REROUTE": "Reroute", "DELAY": "Delay", "ALTITUDE": "Climb"}[best_action]
+    impact, action, params, flight_id = best
+    flight = state.flights[flight_id]
+    target = (params.get("around") or ["an over-demand sector"])[0]
+    action_label = {"REROUTE": "Reroute", "DELAY": "Delay", "ALTITUDE": "Move"}[action]
     rationale = (
-        f"[Offline solver] {action_label} {flight.flight_number} to relieve {worst.label}. "
-        f"Estimated: {best_impact.conflicts_resolved} conflict(s) resolved, "
-        f"+{best_impact.delay_min:.0f} min delay."
+        f"[Offline solver] {action_label} {flight.flight_number} to clear {target}. "
+        f"Resolves {impact.conflicts_resolved} sector(s), +{impact.delay_min:.0f} min, "
+        f"+{impact.extra_nm:.0f} nm, no new over-demand."
     )
 
     return Mitigation(
         id="m_" + uuid.uuid4().hex[:6],
-        action=best_action,
+        action=action,
         flight_id=flight_id,
         flight_number=flight.flight_number,
-        params=best_params,
-        impact=best_impact,
+        params=params,
+        impact=impact,
         rationale=rationale,
     )
