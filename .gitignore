@@ -1,0 +1,27 @@
+# Data bundle (large; lives outside the repo / not committed)
+hackathon_data_bundle/
+**/hackathon_data_bundle/
+*.npz
+sectors.geojson
+routes.json
+routes.json.gz
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Simulation cache
+.sim_cache/
+
+# Secrets / env
+.env
+.env.local
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
