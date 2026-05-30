@@ -210,24 +210,24 @@ def get_sectors_geojson(scenario_id: str):
 # ── Frame ──────────────────────────────────────────────────────────────────────
 
 @app.get("/api/scenario/{scenario_id}/frame", response_model=FrameResponse)
-def get_frame(scenario_id: str, t: str):
+def get_frame(scenario_id: str, t: str, band: str | None = None):
     state = _get_scenario(scenario_id)
     t_dt = _parse_t(t)
-    return compute_frame(state, t_dt)
+    return compute_frame(state, t_dt, band)
 
 
 # ── Timeline ───────────────────────────────────────────────────────────────────
 
 @app.get("/api/scenario/{scenario_id}/timeline", response_model=TimelineResponse)
-def get_timeline(scenario_id: str):
+def get_timeline(scenario_id: str, band: str | None = None):
     state = _get_scenario(scenario_id)
-    return compute_timeline(state)
+    return compute_timeline(state, band)
 
 
 # ── Disrupt ────────────────────────────────────────────────────────────────────
 
 @app.post("/api/scenario/{scenario_id}/disrupt", response_model=DisruptResponse)
-def post_disrupt(scenario_id: str, body: DisruptRequest):
+def post_disrupt(scenario_id: str, body: DisruptRequest, band: str | None = None):
     state = _get_scenario(scenario_id)
 
     # Reset any previous disruption
@@ -241,8 +241,9 @@ def post_disrupt(scenario_id: str, body: DisruptRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    timeline = compute_timeline(state)
-    freeze_baseline(state, timeline)
+    # Freeze the "do nothing" baseline (all bands) right after the disruption
+    freeze_baseline(state)
+    timeline = compute_timeline(state, band)
 
     return DisruptResponse(
         disruption=disruption_info,
@@ -264,7 +265,7 @@ def post_copilot_suggest(scenario_id: str):
 # ── Co-pilot apply ─────────────────────────────────────────────────────────────
 
 @app.post("/api/scenario/{scenario_id}/copilot/apply", response_model=CopilotApplyResponse)
-def post_copilot_apply(scenario_id: str, body: CopilotApplyRequest):
+def post_copilot_apply(scenario_id: str, body: CopilotApplyRequest, band: str | None = None):
     state = _get_scenario(scenario_id)
 
     # Resolve the mitigation
@@ -288,7 +289,7 @@ def post_copilot_apply(scenario_id: str, body: CopilotApplyRequest):
     state.applied.append(mitigation)
     state.pending_mitigation = None
 
-    timeline = compute_timeline(state)
+    timeline = compute_timeline(state, band)
 
     return CopilotApplyResponse(
         applied=mitigation,
@@ -300,7 +301,7 @@ def post_copilot_apply(scenario_id: str, body: CopilotApplyRequest):
 # ── Reset ──────────────────────────────────────────────────────────────────────
 
 @app.post("/api/scenario/{scenario_id}/reset", response_model=ResetResponse)
-def post_reset(scenario_id: str, body: ResetRequest):
+def post_reset(scenario_id: str, body: ResetRequest, band: str | None = None):
     state = _get_scenario(scenario_id)
 
     # Reload fresh flights (to undo all flight mutations)
@@ -329,11 +330,12 @@ def post_reset(scenario_id: str, body: ResetRequest):
     if body.keep_disruption and state.disruption:
         try:
             apply_disruption(new_state, state.disruption)
+            freeze_baseline(new_state)
         except Exception as e:
             log.warning("Could not re-apply disruption on reset: %s", e)
 
     _scenarios[state.scenario_id] = new_state
-    timeline = compute_timeline(new_state)
+    timeline = compute_timeline(new_state, band)
 
     return ResetResponse(timeline=timeline)
 

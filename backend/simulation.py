@@ -154,7 +154,7 @@ class ScenarioState:
     closed_sectors: set[str] = field(default_factory=set)
     applied: list = field(default_factory=list)          # list[schemas.Mitigation]
     pending_mitigation: object = None                    # schemas.Mitigation | None
-    baseline_timeline: list[TimelineFrameCount] = field(default_factory=list)
+    baseline_timeline: dict[str, list[TimelineFrameCount]] = field(default_factory=dict)
     baseline_frames: list[str] = field(default_factory=list)
     total_delay_min: float = 0.0
 
@@ -246,13 +246,17 @@ def _snap_t(t: datetime, t_start: datetime, step_min: int = SIM_STEP_MIN) -> dat
     return t_start + timedelta(minutes=offset)
 
 
-def compute_frame(state: ScenarioState, t: datetime) -> FrameResponse:
+def compute_frame(state: ScenarioState, t: datetime, band: str | None = None) -> FrameResponse:
     t = _snap_t(t, state.t_start)
     wx_strip = get_wx_strip(state.wx_strips, t)
 
-    # Sector occupancy
+    # Sector occupancy (optionally restricted to one altitude band)
     sector_counts: dict[str, list[str]] = {}  # sector_name -> [flight_ids]
     for sname, visit_list in state.visits_by_sector.items():
+        if band is not None:
+            sector = state.sectors.get(sname)
+            if sector is None or sector.band != band:
+                continue
         fids = [v.flight_id for v in visit_list if v.enter_t <= t < v.exit_t]
         if fids:
             sector_counts[sname] = fids
@@ -263,6 +267,8 @@ def compute_frame(state: ScenarioState, t: datetime) -> FrameResponse:
     closed_flight_ids: set[str] = set()
 
     for fid, flight in state.flights.items():
+        if band is not None and flight.band != band:
+            continue
         pos = state.trajectories[fid].position(t)
         if pos is None:
             continue
@@ -328,6 +334,10 @@ def compute_frame(state: ScenarioState, t: datetime) -> FrameResponse:
 
     # Closed-sector conflicts
     for sname in state.closed_sectors:
+        if band is not None:
+            sector = state.sectors.get(sname)
+            if sector is None or sector.band != band:
+                continue
         in_closed = [fid for fid in closed_flight_ids
                      if any(v.sector_name == sname and v.enter_t <= t < v.exit_t
                             for v in state.visits_by_flight.get(fid, []))]
@@ -390,7 +400,7 @@ def compute_frame(state: ScenarioState, t: datetime) -> FrameResponse:
 
 # ── Timeline ────────────────────────────────────────────────────────────────────
 
-def compute_timeline(state: ScenarioState) -> TimelineResponse:
+def compute_timeline(state: ScenarioState, band: str | None = None) -> TimelineResponse:
     frame_times: list[datetime] = []
     t = state.t_start
     while t <= state.t_end:
@@ -399,7 +409,7 @@ def compute_timeline(state: ScenarioState) -> TimelineResponse:
 
     current_counts: list[TimelineFrameCount] = []
     for ft in frame_times:
-        frame = compute_frame(state, ft)
+        frame = compute_frame(state, ft, band)
         od = sum(1 for c in frame.conflicts if c.kind == "OVER_DEMAND")
         wx = sum(1 for c in frame.conflicts if c.kind == "WEATHER")
         cl = sum(1 for c in frame.conflicts if c.kind == "CLOSED_SECTOR")
@@ -414,7 +424,7 @@ def compute_timeline(state: ScenarioState) -> TimelineResponse:
             peak_total = fc.total
             peak_idx = i
 
-    baseline = state.baseline_timeline if state.baseline_timeline else [
+    baseline = state.baseline_timeline.get(band or "ALL") or [
         TimelineFrameCount(over_demand=0, weather=0, closed=0, total=0)
         for _ in frame_times
     ]
@@ -432,7 +442,14 @@ def compute_timeline(state: ScenarioState) -> TimelineResponse:
     )
 
 
-def freeze_baseline(state: ScenarioState, timeline: TimelineResponse) -> None:
-    """Snapshot the current timeline as the baseline (call once after disruption is applied)."""
-    state.baseline_timeline = timeline.current
-    state.baseline_frames = timeline.frames
+def freeze_baseline(state: ScenarioState) -> None:
+    """Snapshot the current timeline as the "do nothing" baseline, per band.
+
+    Call once right after a disruption is applied (before any mitigations), so the
+    UI can overlay baseline vs AI-managed for whichever band it is viewing.
+    """
+    for band in (None, "HIGH", "LOW"):
+        tl = compute_timeline(state, band)
+        state.baseline_timeline[band or "ALL"] = tl.current
+        if band is None:
+            state.baseline_frames = tl.frames
