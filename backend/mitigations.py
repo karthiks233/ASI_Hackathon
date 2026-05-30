@@ -1,9 +1,11 @@
 """Reroute / delay / altitude mitigations: evaluate (what-if) and apply.
 
-Each mitigation moves a single flight. `evaluate_*` builds a candidate flight,
-computes its new sector visits WITHOUT touching shared state, and measures impact
-via the incremental `impact_of_change` (only the sectors the flight enters/leaves are
-re-checked). `apply_*` commits the change with `rebuild_flight`.
+Each mitigation moves one or more flights. `evaluate_*` builds candidate flights,
+computes their new sector visits WITHOUT touching shared state, and measures impact
+incrementally (only the sectors involved are re-checked). `apply_*` commits via
+`rebuild_flight`. The deterministic solver builds a "ground delay program" — it holds
+just enough contributing flights to bring an over-demand sector back under capacity —
+so it can reliably clear a sector even when one flight is not enough.
 """
 from __future__ import annotations
 
@@ -19,9 +21,11 @@ from .geo import cum_dist_nm
 from .schemas import Mitigation, MitigationImpact
 from .simulation import (
     ScenarioState,
+    build_occupancy,
     build_sector_visits,
     build_trajectory,
     impact_of_change,
+    impact_of_changes,
     rebuild_flight,
 )
 
@@ -92,10 +96,14 @@ def _altitude_candidate(flight: Flight, new_alt_ft: int) -> tuple[Flight, float,
     return new_flight, 0.0, 0.0
 
 
+def _candidate_visits(state: ScenarioState, candidate: Flight) -> list:
+    traj = build_trajectory(candidate)
+    return build_sector_visits(candidate, traj, state.strtrees, state.sectors)
+
+
 def _measure(state: ScenarioState, flight_id: str, candidate: Flight, extra_nm: float, delay_min: float) -> MitigationImpact:
     """Impact of switching `flight_id` to `candidate`, without mutating state."""
-    new_traj = build_trajectory(candidate)
-    new_visits = build_sector_visits(candidate, new_traj, state.strtrees, state.sectors)
+    new_visits = _candidate_visits(state, candidate)
     resolved, created = impact_of_change(state, flight_id, new_visits)
     return MitigationImpact(
         conflicts_resolved=resolved,
@@ -161,6 +169,41 @@ def apply_altitude(state: ScenarioState, flight_id: str, new_alt_ft: int) -> Mit
     return impact
 
 
+# ── GROUND DELAY PROGRAM (multi-flight) ─────────────────────────────────────────
+
+PROGRAM_DELAY_MIN = 60.0
+
+
+def _program_changes(state: ScenarioState, flight_ids: list[str], minutes: float):
+    """Build (flight_id, new_visits) for delaying each flight by `minutes`."""
+    changes = []
+    for fid in flight_ids:
+        flight = state.flights.get(fid)
+        if flight is None:
+            continue
+        cand, _, _ = _delay_candidate(flight, minutes)
+        changes.append((fid, _candidate_visits(state, cand)))
+    return changes
+
+
+def apply_ground_program(state: ScenarioState, flight_ids: list[str], minutes: float) -> MitigationImpact:
+    changes = _program_changes(state, flight_ids, minutes)
+    resolved, created = impact_of_changes(state, changes)
+    for fid in flight_ids:
+        flight = state.flights.get(fid)
+        if flight is None:
+            continue
+        cand, _, _ = _delay_candidate(flight, minutes)
+        rebuild_flight(state, cand)
+        state.total_delay_min += minutes
+    return MitigationImpact(
+        conflicts_resolved=resolved,
+        conflicts_created=created,
+        delay_min=round(minutes, 1),
+        extra_nm=0.0,
+    )
+
+
 # ── Dispatch ────────────────────────────────────────────────────────────────────
 
 def apply_mitigation(state: ScenarioState, mit: Mitigation) -> MitigationImpact:
@@ -169,97 +212,64 @@ def apply_mitigation(state: ScenarioState, mit: Mitigation) -> MitigationImpact:
         p = mit.params
         return apply_reroute(state, fid, p["side"], p.get("around", []))
     elif mit.action == "DELAY":
-        return apply_delay(state, fid, float(mit.params["minutes"]))
+        # Multi-flight ground delay program if flight_ids present, else single flight.
+        flight_ids = mit.params.get("flight_ids")
+        minutes = float(mit.params.get("minutes", PROGRAM_DELAY_MIN))
+        if flight_ids:
+            return apply_ground_program(state, flight_ids, minutes)
+        return apply_delay(state, fid, minutes)
     elif mit.action == "ALTITUDE":
         return apply_altitude(state, fid, int(mit.params["new_alt_ft"]))
     else:
         raise ValueError(f"Unknown action: {mit.action}")
 
 
-# ── Deterministic solver (fallback) ────────────────────────────────────────────
+# ── Deterministic solver ────────────────────────────────────────────────────────
 
 def deterministic_best(state: ScenarioState) -> Mitigation | None:
-    """Target the most "winnable" over-demand sector (closest to capacity) and try
-    fixes on its contributing flights until one fully clears it. This mirrors the
-    strategy the Claude prompt uses, so the fallback is just as effective."""
-    from .simulation import build_occupancy
-
-    # Rank over-demand sectors across the WHOLE timeline by overage (closest to
-    # capacity first — those are the ones a single fix can fully clear).
+    """Pick the most "winnable" over-demand sector (closest to capacity) and build a
+    ground delay program that holds just enough of its contributing flights to bring
+    it back under capacity — without tipping any other sector over. Reliable: it can
+    clear sectors that are several flights over, not just one."""
     grid = build_occupancy(state)
-    targets: list[tuple[str, int]] = []   # (sector_name, peak_overage)
+    targets: list[tuple[int, str]] = []   # (overage, sector)
     for sname, occ in grid.items():
         cap = state.sectors[sname].capacity
         overage = max(occ) - cap
         if overage > 0:
-            targets.append((sname, overage))
+            targets.append((overage, sname))
     if not targets:
         return None
-    targets.sort(key=lambda x: x[1])
+    targets.sort(key=lambda x: x[0])   # smallest overage first (most winnable)
 
-    best: tuple[MitigationImpact, str, dict, str] | None = None  # (impact, action, params, flight_id)
-
-    for sname, _overage in targets[:12]:
-        around = [sname]
-        # Flights that transit this sector are the contributors
+    for overage, sname in targets[:15]:
         contributing = list(dict.fromkeys(v.flight_id for v in state.visits_by_sector.get(sname, [])))
-        for flight_id in contributing[:6]:
-            flight = state.flights.get(flight_id)
-            if flight is None:
-                continue
-            trials: list[tuple[MitigationImpact, str, dict]] = []
-            for side in ("north", "south", "east", "west"):
-                try:
-                    imp, p = evaluate_reroute(state, flight_id, side, around)
-                    trials.append((imp, "REROUTE", p))
-                except Exception:
-                    pass
-            try:
-                imp, p = evaluate_delay(state, flight_id, 30.0)
-                trials.append((imp, "DELAY", p))
-            except Exception:
-                pass
-            new_alt = flight.cruise_alt_ft + (2000 if flight.cruise_alt_ft < 35000 else 4000)
-            try:
-                imp, p = evaluate_altitude(state, flight_id, new_alt)
-                trials.append((imp, "ALTITUDE", p))
-            except Exception:
-                pass
-
-            # Best trial for this flight: maximize cleared, no new over-demand, least delay
-            for imp, action, params in trials:
-                if imp.conflicts_created > 0:
-                    continue
-                key = (imp.conflicts_resolved, -imp.delay_min, -imp.extra_nm)
-                if imp.conflicts_resolved >= 1 and (
-                    best is None or key > (best[0].conflicts_resolved, -best[0].delay_min, -best[0].extra_nm)
-                ):
-                    best = (imp, action, params, flight_id)
-            # A clean win on this sector — take it
-            if best is not None and best[0].conflicts_resolved >= 1:
-                break
-        if best is not None and best[0].conflicts_resolved >= 1:
-            break
-
-    if best is None:
-        return None
-
-    impact, action, params, flight_id = best
-    flight = state.flights[flight_id]
-    target = (params.get("around") or ["an over-demand sector"])[0]
-    action_label = {"REROUTE": "Reroute", "DELAY": "Delay", "ALTITUDE": "Move"}[action]
-    rationale = (
-        f"[Offline solver] {action_label} {flight.flight_number} to clear {target}. "
-        f"Resolves {impact.conflicts_resolved} sector(s), +{impact.delay_min:.0f} min, "
-        f"+{impact.extra_nm:.0f} nm, no new over-demand."
-    )
-
-    return Mitigation(
-        id="m_" + uuid.uuid4().hex[:6],
-        action=action,
-        flight_id=flight_id,
-        flight_number=flight.flight_number,
-        params=params,
-        impact=impact,
-        rationale=rationale,
-    )
+        if not contributing:
+            continue
+        # Hold progressively more of the contributing flights until the sector clears.
+        for k in range(overage, min(len(contributing), overage + 4) + 1):
+            flight_ids = contributing[:k]
+            changes = _program_changes(state, flight_ids, PROGRAM_DELAY_MIN)
+            resolved, created = impact_of_changes(state, changes)
+            if resolved >= 1 and created == 0:
+                primary = state.flights[flight_ids[0]]
+                fn = primary.flight_number
+                label = f"{fn}" if k == 1 else f"{fn} +{k - 1} more"
+                return Mitigation(
+                    id="m_" + uuid.uuid4().hex[:6],
+                    action="DELAY",
+                    flight_id=flight_ids[0],
+                    flight_number=label,
+                    params={"minutes": PROGRAM_DELAY_MIN, "flight_ids": flight_ids, "around": [sname]},
+                    impact=MitigationImpact(
+                        conflicts_resolved=resolved,
+                        conflicts_created=created,
+                        delay_min=PROGRAM_DELAY_MIN,
+                        extra_nm=0.0,
+                    ),
+                    rationale=(
+                        f"Hold {label} by {int(PROGRAM_DELAY_MIN)} min to bring {sname} back under "
+                        f"capacity — clears {resolved} over-demand sector(s) with no new hotspots."
+                    ),
+                )
+    return None

@@ -430,14 +430,60 @@ def _fallback_suggest(state: ScenarioState) -> CopilotSuggestResponse:
     )
 
 
+# ── Claude rationale (hybrid path) ──────────────────────────────────────────────
+
+def _claude_rationale(state: ScenarioState, mit: Mitigation, world_summary: str) -> str:
+    """One fast, no-tool Claude call to write an operational rationale for a fix the
+    solver already found and verified. Reliable and quick (the tool-use search is the
+    slow, flaky part — this keeps Claude doing what it's best at: explaining)."""
+    import anthropic
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    target = (mit.params.get("around") or ["the targeted sector"])[0]
+    user = (
+        f"Airspace status: {world_summary}\n\n"
+        f"Recommended fix (already verified against the simulation):\n"
+        f"- Action: {mit.action}\n"
+        f"- Flight: {mit.flight_number} ({mit.flight_id})\n"
+        f"- Params: {json.dumps(mit.params)}\n"
+        f"- Relieves sector: {target}\n"
+        f"- Measured impact: clears {mit.impact.conflicts_resolved} over-demand sector(s), "
+        f"creates {mit.impact.conflicts_created} new, +{mit.impact.delay_min:.0f} min delay, "
+        f"+{mit.impact.extra_nm:.0f} nm.\n\n"
+        f"Write ONE or TWO crisp sentences a controller would say, explaining why this is a "
+        f"good next move. Name the flight and sector. No preamble — just the rationale."
+    )
+    resp = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=200,
+        system=[{"type": "text",
+                 "text": "You are an AI co-pilot in an air-traffic flow-management war room. "
+                         "You write tight, confident, operational rationales for sector over-demand fixes.",
+                 "cache_control": {"type": "ephemeral"}}],
+        messages=[{"role": "user", "content": user}],
+    )
+    parts = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
+    return " ".join(parts).strip() or mit.rationale
+
+
 # ── Public entrypoint ───────────────────────────────────────────────────────────
 
 def suggest(state: ScenarioState) -> CopilotSuggestResponse:
+    """Hybrid: the deterministic solver finds and verifies the best single fix; Claude
+    explains it. Falls back to the templated rationale if Claude is unavailable."""
+    world_summary = _build_world_summary(state)
+    if "All clear" in world_summary:
+        return CopilotSuggestResponse(mitigation=None, world_summary=world_summary, source="claude")
+
+    mitigation = deterministic_best(state)
+    if mitigation is None:
+        return CopilotSuggestResponse(mitigation=None, world_summary=world_summary, source="fallback")
+
     if not ANTHROPIC_API_KEY:
-        log.info("No ANTHROPIC_API_KEY — using deterministic fallback")
-        return _fallback_suggest(state)
+        return CopilotSuggestResponse(mitigation=mitigation, world_summary=world_summary, source="fallback")
+
     try:
-        return _claude_suggest(state)
+        mitigation.rationale = _claude_rationale(state, mitigation, world_summary)
+        return CopilotSuggestResponse(mitigation=mitigation, world_summary=world_summary, source="claude")
     except Exception as e:
-        log.error("Claude co-pilot error: %s", e, exc_info=True)
-        return _fallback_suggest(state)
+        log.error("Claude rationale failed, using template: %s", e)
+        return CopilotSuggestResponse(mitigation=mitigation, world_summary=world_summary, source="fallback")

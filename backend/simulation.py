@@ -505,3 +505,48 @@ def impact_of_change(
         elif not was_over and now_over:
             created += 1
     return resolved, created
+
+
+def impact_of_changes(
+    state: ScenarioState,
+    changes: list[tuple[str, list["SectorVisit"]]],
+) -> tuple[int, int]:
+    """Combined (sectors_resolved, sectors_created) for moving several flights at once
+    (a ground delay program). No state mutation."""
+    grid = build_occupancy(state)
+    n = len(next(iter(grid.values()))) if grid else len(_frame_times(state))
+    step_s = float(SIM_STEP_MIN * 60)
+
+    affected: set[str] = set()
+    for fid, new_visits in changes:
+        for v in state.visits_by_flight.get(fid, []):
+            affected.add(v.sector_name)
+        for v in new_visits:
+            affected.add(v.sector_name)
+
+    resolved = created = 0
+    for sname in affected:
+        sector = state.sectors.get(sname)
+        if sector is None:
+            continue
+        cap = sector.capacity
+        base = grid.get(sname, [0] * n)
+        was_over = any(c > cap for c in base)
+        after = list(base)
+        for fid, new_visits in changes:
+            for v in state.visits_by_flight.get(fid, []):
+                if v.sector_name == sname:
+                    lo, hi = _visit_frame_span(state, v, n, step_s)
+                    for i in range(lo, hi + 1):
+                        after[i] -= 1
+            for v in new_visits:
+                if v.sector_name == sname:
+                    lo, hi = _visit_frame_span(state, v, n, step_s)
+                    for i in range(lo, hi + 1):
+                        after[i] += 1
+        now_over = any(c > cap for c in after)
+        if was_over and not now_over:
+            resolved += 1
+        elif not was_over and now_over:
+            created += 1
+    return resolved, created
