@@ -1,17 +1,36 @@
-# Airway Superintelligence — System Design
+# AI Flight Disruption War Room — System Design
 
-**Hackathon:** ASI Hackathon 2026  
-**Team:** Karthik Raja + teammate  
-**Date:** 2026-05-30  
+**Hackathon:** ASI Hackathon 2026
+**Date:** 2026-05-30
 **Living Doc:** [Google Doc](https://docs.google.com/document/d/1MlgbDywEloj09Aqc2POS3nQjshg0tGSJZAd6pdLOtlY/edit?tab=t.0)
 
 ---
 
 ## 1. Project Overview
 
-**Airway Superintelligence** is an AI-powered flight route optimizer that recommends the safest and most efficient airways between two airports. Given a departure airport, destination, aircraft type, and departure time, the system fetches real-time and forecast weather data (METARs, TAFs, SIGMETs, PIREPs, winds-aloft) and uses Claude to reason over candidate routes — scoring each for turbulence risk, icing, convective activity, headwind penalty, and airspace constraints — then returns an optimized flight plan with a plain-language hazard briefing.
+**AI Flight Disruption War Room** is a real-time decision-support dashboard for air-traffic
+flow management. A simulated disruption — a storm, a closed sector, or an airport ground
+stop — hits the US National Airspace, and the operator watches **live as flights cascade into
+conflict**: sectors tip over their capacity, aircraft penetrate severe weather, traffic backs
+up. An **AI co-pilot** (Claude) then reasons over the live conflict picture and proposes fixes
+**one at a time** — reroute this flight, hold that departure, climb this one above the echo
+tops — each with a plain-language justification and a measured before/after impact. The
+operator applies a fix, the simulation recomputes, and the room calms down.
 
-**Target users:** Student pilots, GA (General Aviation) pilots, flight dispatchers, and flight planning tools.
+It is built entirely on the provided `hackathon_data_bundle`: real US flight routes
+(16,687 flights with full waypoint paths), 712 synthetic ATC sectors with capacities, and
+time-stepped HRRR weather forecasts (composite reflectivity + echo tops).
+
+**Why it scores on every criterion**
+
+| Criterion | How the War Room delivers |
+|-----------|---------------------------|
+| Technical merit | Time-stepped trajectory simulation, point-in-polygon sector occupancy via spatial index, capacity/weather/closure conflict detection, constraint-aware rerouting, Claude tool-use loop |
+| Problem understanding | Models the *cascading* nature of ATC disruptions — one closed sector pushes demand into neighbors, which tip over in turn |
+| Communication | Visceral, watchable demo: judges see red sectors bloom and the AI cool them down live on a map |
+| Creativity | The "war room + AI co-pilot suggesting fixes one by one" framing is memorable and dramatic |
+
+**Team:** <!-- names -->
 
 ---
 
@@ -19,75 +38,75 @@
 
 ### 2.1 Functional Requirements
 
-| ID   | Requirement | Priority |
-|------|-------------|----------|
-| FR-1 | User inputs departure ICAO, destination ICAO, departure time, cruise altitude, aircraft type | Must Have |
-| FR-2 | System fetches live METARs, TAFs, SIGMETs, PIREPs, and winds-aloft along candidate routes | Must Have |
-| FR-3 | Claude reasons over weather data and returns an optimized route as ordered waypoints | Must Have |
-| FR-4 | Each route is scored: turbulence risk, icing risk, convective risk, wind efficiency | Must Have |
-| FR-5 | System returns a plain-language pilot briefing explaining the recommendation | Must Have |
-| FR-6 | User can request 1–3 alternative routes if the primary is unacceptable | Should Have |
-| FR-7 | Routes are rendered on an interactive map (Leaflet.js) | Should Have |
-| FR-8 | System checks active NOTAMs and restricted airspace along the route | Should Have |
-| FR-9 | Historical route + weather data is stored for ML training and analytics | Nice to Have |
-| FR-10 | Estimated fuel burn delta between route options | Nice to Have |
+| ID    | Requirement | Priority |
+|-------|-------------|----------|
+| FR-1  | Load a flight-route snapshot, the sector geometry, and the matching weather forecast strips | Must Have |
+| FR-2  | Simulate every flight's position over a time window (constant cruise speed/altitude model) | Must Have |
+| FR-3  | Assign each flight to its sector (correct altitude band) at each timestep via spatial index | Must Have |
+| FR-4  | Detect conflicts: sector **over-demand**, **weather penetration**, **closed-sector** intrusion | Must Have |
+| FR-5  | Inject a disruption scenario: **storm** (from weather data), **sector closure**, **airport ground stop** | Must Have |
+| FR-6  | Animate the cascade on a map: flight dots, sector load heatmap, storm overlay, timeline scrubber | Must Have |
+| FR-7  | AI co-pilot (Claude, tool use) inspects the live conflict set and proposes mitigations one at a time | Must Have |
+| FR-8  | Each mitigation has a before/after impact (conflicts resolved, delay minutes, extra distance) | Must Have |
+| FR-9  | Operator applies/rejects a suggestion; simulation recomputes only the affected flights | Must Have |
+| FR-10 | Conflict feed + "peak over-demand" timeline so the operator sees the worst moment | Should Have |
+| FR-11 | Reset / replay the scenario to compare "do nothing" vs "AI-managed" outcomes | Should Have |
+| FR-12 | Multiple prebuilt scenarios selectable from the bundle's 11 snapshots | Nice to Have |
 
 ### 2.2 Non-Functional Requirements
 
 | ID    | Requirement | Target |
 |-------|-------------|--------|
-| NFR-1 | Latency | Route recommendation returned in < 8 seconds (including weather fetch + Claude call) |
-| NFR-2 | Weather data freshness | METARs refreshed every 30 min, SIGMETs every 5 min |
-| NFR-3 | Availability | 99% uptime for demo; weather API failures degrade gracefully |
-| NFR-4 | Security | API keys in env vars; no auth required for MVP demo |
-| NFR-5 | Observability | Structured JSON logs for every route request + Claude call |
+| NFR-1 | Scrub/animate latency | Timestep frame served from precomputed state in < 100 ms |
+| NFR-2 | Scenario load | First load builds + caches the sim; subsequent loads from cache in < 3 s |
+| NFR-3 | Co-pilot turnaround | A mitigation suggestion returned in < 10 s (Claude call + tool round-trips) |
+| NFR-4 | Resilience | Missing `ANTHROPIC_API_KEY` degrades co-pilot to the deterministic solver, app still runs |
+| NFR-5 | Scale | Handle the full ~16.7k-flight snapshot without pre-filtering |
+| NFR-6 | Observability | Structured logs for sim builds, conflict counts per frame, and every co-pilot action |
 
 ### 2.3 Out of Scope (MVP)
 
-- Full ETOPS / oceanic route planning
-- ATC clearance simulation
-- Paid tier / user accounts
-- Mobile app
-- FAA / EASA regulatory compliance (advisory use only)
+- Climb/descent and en-route speed changes (constant cruise model per the data spec)
+- Real-time live ADS-B ingestion (we replay the provided snapshots)
+- Multi-user / authentication / persistence beyond an in-process scenario cache
+- Provably optimal flow program (we do greedy, AI-guided, locally-valid mitigations)
 
 ---
 
 ## 3. Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         Browser / Client                        │
-│  Route Form  ──►  Map View (Leaflet)  ──►  Hazard Briefing UI  │
-└────────────────────────────┬────────────────────────────────────┘
-                             │  REST / JSON
-                             ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    FastAPI Backend (Python)                      │
-│                                                                 │
-│  POST /optimize  ──►  RouteOptimizer Service                    │
-│                              │                                  │
-│              ┌───────────────┼────────────────┐                 │
-│              ▼               ▼                ▼                 │
-│      WeatherFetcher    RouteGenerator    AirspaceChecker        │
-│      (async calls)    (waypoint graph)  (NOTAM + TFR)          │
-│              │               │                                  │
-│              └───────────────┘                                  │
-│                              │  Assembled context               │
-│                              ▼                                  │
-│                    Claude API (tool use)                        │
-│                    claude-sonnet-4-6                            │
-│                              │  Structured route + briefing     │
-│                              ▼                                  │
-│                      Response Builder                           │
-└──────────────────────────────┬──────────────────────────────────┘
-                               │
-            ┌──────────────────┼──────────────────┐
-            ▼                  ▼                  ▼
-   PostgreSQL DB       Aviation Weather      FAA NOTAM API
-   (route history)     API (NOAA/AWC)        (or alternatives)
+┌──────────────────────────────────────────────────────────────────────┐
+│                          Browser — War Room UI                         │
+│  Leaflet map        Timeline scrubber       Conflict feed     AI panel │
+│  • flight dots      • play / scrub          • over-demand     • Claude │
+│  • sector heatmap   • peak-conflict marker  • wx penetration    fixes  │
+│  • storm overlay                            • closed sector   • apply  │
+└───────────────┬──────────────────────────────────────────┬────────────┘
+                │  GET frame state / POST disruption        │  POST copilot/suggest
+                ▼                                           ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                        FastAPI backend (Python)                        │
+│                                                                        │
+│   /scenarios          DataLoader        ── routes.json (gz)            │
+│   /scenario/load   ──► • flights        ── sectors.geojson            │
+│   /frame              • sectors (STRtree) ── wx refc/retop .npz        │
+│   /disrupt         ──► SimulationEngine                                │
+│   /copilot/suggest    • trajectory interpolation (numpy)              │
+│   /copilot/apply      • per-flight sector timelines                   │
+│   /reset              • conflict detection (over-demand/wx/closure)   │
+│                              │                                         │
+│                       DisruptionEngine  (storm / closure / ground stop)│
+│                              │                                         │
+│                       Mitigation tools  (reroute / delay / altitude)   │
+│                              │                                         │
+│                       Copilot (Claude tool-use)  claude-opus-4-8       │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-**Architecture style:** Monolith (single FastAPI app) — keeps the demo deployable in one command.
+**Architecture style:** Single FastAPI monolith serving a static SPA. All simulation state
+lives in memory keyed by `scenario_id`; the heavy sector-timeline build is cached to disk
+(pickle) per snapshot so only the first run pays the cost.
 
 ---
 
@@ -95,102 +114,119 @@
 
 | Layer | Technology | Reason |
 |-------|-----------|--------|
-| Frontend | Vanilla HTML + Leaflet.js (or minimal React) | Fast to ship; map rendering built-in |
-| Backend | Python 3.12 + FastAPI | Async-friendly, great for concurrent weather fetches |
-| AI | Claude `claude-sonnet-4-6` via Anthropic SDK | Best reasoning over semi-structured weather data |
-| Database | PostgreSQL + SQLAlchemy (async) | Store route requests + results for demo replay |
-| Weather APIs | NOAA Aviation Weather Center (aviationweather.gov) | Free, official, real-time METARs/TAFs/SIGMETs/PIREPs |
-| Airspace | FAA DroneZone / AIP API or static GeoJSON | NOTAM and restricted airspace lookup |
-| HTTP Client | `httpx` (async) | Parallel weather fetches |
-| Config | `pydantic-settings` + `.env` | Clean env var management |
-| Deployment | Docker Compose (demo) | One command startup |
+| Frontend | Vanilla HTML/CSS/JS + **Leaflet.js** | No build step, instant load, map + overlays built-in — ideal for a live demo |
+| Backend | Python 3.13 + **FastAPI** + Uvicorn | Async API, trivial static hosting, ecosystem for geo/data |
+| Geo / sim | **NumPy** (vectorized trajectory math) + **Shapely 2** (`STRtree` spatial index, point-in-polygon) | Fast occupancy computation over 712 sectors × 16.7k flights |
+| Weather | **NumPy** `.npz` grids (HRRR refc/retop) | Provided format; equirectangular grid → O(1) pixel lookup |
+| AI | **Claude `claude-opus-4-8`** via Anthropic SDK, **tool use** | Reasons over the conflict set and drives deterministic mitigation tools; prompt caching on the system/world prompt |
+| Config | `python-dotenv` + env vars | `ANTHROPIC_API_KEY`, data bundle path |
+| Cache | Local pickle of per-snapshot sector timelines | Sub-3s warm scenario loads |
 
 ---
 
 ## 5. Data Model
 
-### Entity: `RouteRequest`
+The bundle is the source of truth; these are the **in-memory** structures the engine builds.
+
+### Loaded inputs (from the bundle)
+
 ```
-id              UUID        PK
-departure_icao  VARCHAR(4)
-destination_icao VARCHAR(4)
-departure_time  TIMESTAMP
-cruise_altitude_ft INT
-aircraft_type   VARCHAR(10)  -- e.g. "C172", "B738"
-created_at      TIMESTAMP
+Flight                         # from routes.json
+  flight_id      str           # f"{flight_number}|{take_off_time}|{origin}"  (unique)
+  flight_number  str
+  origin / dest  ICAO
+  take_off_time  datetime (UTC)
+  landing_time   datetime (UTC)
+  cruise_alt_ft  int
+  cruise_speed_kt int
+  band           "HIGH"|"LOW"  # HIGH iff cruise_alt_ft >= 35000
+  lats, lons     float[]       # planned waypoints, origin → dest
+  is_airborne    bool
+
+Sector                         # from sectors.geojson
+  name           str           # HIGH_NNN / LOW_NNN
+  band           "HIGH"|"LOW"
+  alt_from/to_ft int
+  capacity       int
+  geom           shapely Polygon
+
+WxFrame                        # from wx/refc & wx/retop .npz
+  valid_from/to  datetime
+  refc           float[256,358]  # dBZ
+  retop          float[256,358]  # ft
 ```
 
-### Entity: `RouteResult`
+### Derived / runtime structures
+
 ```
-id              UUID        PK
-request_id      UUID        FK → RouteRequest
-waypoints       JSONB       -- [{ icao, lat, lon, alt_ft }]
-risk_scores     JSONB       -- { turbulence: 0-10, icing: 0-10, convective: 0-10, wind_penalty: 0-10 }
-overall_score   FLOAT
-briefing_text   TEXT        -- Claude's plain-language explanation
-raw_weather     JSONB       -- snapshot of weather data used
-claude_tokens   INT
-created_at      TIMESTAMP
+Trajectory (per flight, precomputed)
+  cum_dist_nm    float[]        # cumulative great-circle distance along waypoints
+  total_nm       float
+  t0, t1         datetime       # take_off, landing (mutable: ground hold shifts both)
+  -> position(t) = interpolate lat/lon by distance fraction
+
+SectorVisit (per flight, precomputed timeline)
+  flight_id, sector_name, enter_t, exit_t
+
+FrameState (per timestep t, served to UI)
+  t
+  flights[]      {flight_id, lat, lon, band, status}      # status: ok|weather|closed
+  sector_load[]  {sector_name, count, capacity, ratio}    # ratio>1 => over-demand
+  conflicts[]    Conflict
+  metrics        {over_demand_sectors, weather_flights, total_delay_min, ...}
+
+Conflict
+  kind           "OVER_DEMAND"|"WEATHER"|"CLOSED_SECTOR"
+  severity       float
+  sector_name?   str
+  flight_ids[]   str
+  t_window       [start, end]
+
+Disruption
+  kind           "STORM"|"SECTOR_CLOSURE"|"GROUND_STOP"
+  params         {...}          # e.g. closed sector names, airport, refc threshold, hold window
+
+Mitigation (proposed or applied)
+  action         "REROUTE"|"DELAY"|"ALTITUDE"
+  flight_id      str
+  params         {...}
+  impact         {conflicts_resolved, conflicts_created, delay_min, extra_nm}
+  rationale      str            # Claude's explanation
 ```
 
-### Entity: `WeatherSnapshot`
-```
-id              UUID        PK
-station_icao    VARCHAR(4)
-type            VARCHAR(10)  -- METAR, TAF, SIGMET, PIREP
-raw_text        TEXT
-parsed_json     JSONB
-fetched_at      TIMESTAMP
-```
-
-**Relationships:**
-- RouteRequest has one RouteResult
-- RouteResult references many WeatherSnapshots
+**Relationships:** a Scenario = one snapshot + one Disruption + an ordered list of applied
+Mitigations. Re-running a Mitigation only recomputes the trajectories/visits of the flights it
+touches, then re-aggregates frame state.
 
 ---
 
 ## 6. API Design
 
-| Method | Path | Description | Auth |
-|--------|------|-------------|------|
-| POST | `/api/optimize` | Submit a route optimization request | No |
-| GET | `/api/optimize/{id}` | Fetch a previous result by ID | No |
-| GET | `/api/weather/metar/{icao}` | Live METAR for a single station | No |
-| GET | `/api/weather/sigmet` | Active SIGMETs in a bounding box | No |
-| GET | `/api/health` | Health check | No |
+| Method | Path | Description |
+|--------|------|-------------|
+| GET  | `/api/scenarios` | List available snapshots + prebuilt disruption presets |
+| POST | `/api/scenario/load` | Build (or load from cache) the sim for a snapshot → `scenario_id`, time bounds |
+| GET  | `/api/scenario/{id}/frame?t=...` | Frame state at time `t` (flights, sector load, conflicts, metrics) |
+| GET  | `/api/scenario/{id}/timeline` | Per-timestep conflict counts (for the scrubber + peak marker) |
+| POST | `/api/scenario/{id}/disrupt` | Inject a disruption; recompute; returns new timeline summary |
+| POST | `/api/scenario/{id}/copilot/suggest` | Ask Claude for the next single mitigation given current conflicts |
+| POST | `/api/scenario/{id}/copilot/apply` | Apply a mitigation (reroute/delay/altitude); recompute affected flights |
+| POST | `/api/scenario/{id}/reset` | Drop applied mitigations / disruption; back to baseline |
+| GET  | `/api/scenario/{id}/sectors.geojson` | Sector polygons (for the map, sent once) |
+| GET  | `/api/health` | Health + whether the Claude key is configured |
 
-### POST `/api/optimize` — Request Body
+### POST `/api/scenario/{id}/copilot/suggest` — Response (shape)
+
 ```json
 {
-  "departure_icao": "KBOS",
-  "destination_icao": "KLAX",
-  "departure_time": "2026-05-30T18:00:00Z",
-  "cruise_altitude_ft": 35000,
-  "aircraft_type": "B738"
-}
-```
-
-### POST `/api/optimize` — Response
-```json
-{
-  "request_id": "uuid",
-  "recommended_route": {
-    "waypoints": [
-      { "id": "KBOS", "lat": 42.36, "lon": -71.01, "type": "airport" },
-      { "id": "ALB",  "lat": 42.74, "lon": -73.80, "type": "vor" },
-      { "id": "KLAX", "lat": 33.94, "lon": -118.40, "type": "airport" }
-    ],
-    "risk_scores": {
-      "turbulence": 3,
-      "icing": 1,
-      "convective": 0,
-      "wind_penalty": 4
-    },
-    "overall_score": 2.8,
-    "estimated_flight_time_min": 318
+  "mitigation": {
+    "action": "REROUTE",
+    "flight_id": "AAL1234|2025-05-29T21:10:00+00:00|KORD",
+    "params": { "around": ["HIGH_142", "HIGH_143"], "detour_side": "north" },
+    "impact": { "conflicts_resolved": 3, "conflicts_created": 0, "delay_min": 7, "extra_nm": 48 },
+    "rationale": "AAL1234 is the largest single contributor to the HIGH_142 over-demand at 22:40Z. A northern detour around the closed cells clears it with only ~7 min added and creates no new hotspots."
   },
-  "briefing": "The recommended route via ALB and J80 avoids a SIGMET for moderate turbulence over the Rockies. Expect light icing between FL240-FL280 near DEN; recommend FL350. Tailwind component of ~40kts over the Plains improves block time by approximately 22 minutes versus direct routing.",
-  "alternatives": []
+  "world_summary": "2 sectors over capacity, peak 22:40Z; 5 flights penetrating the storm core."
 }
 ```
 
@@ -198,149 +234,186 @@ fetched_at      TIMESTAMP
 
 ## 7. Key Flows
 
-### Flow 1: Route Optimization Request
+### Flow 1: Watch the cascade
 
-1. User fills in the form (departure, destination, time, altitude, aircraft) and hits "Optimize"
-2. Frontend POSTs to `/api/optimize`
-3. FastAPI spins up `RouteOptimizer`:
-   - `RouteGenerator` computes 2–3 candidate route corridors (direct + northern/southern deviations)
-   - `WeatherFetcher` fires parallel `httpx` requests to AWC for METARs, TAFs, SIGMETs, PIREPs, winds-aloft along each corridor
-   - `AirspaceChecker` queries active NOTAMs and TFRs
-4. All data is assembled into a structured context payload
-5. Claude is called with tool use — it can call `get_weather_at_waypoint`, `score_turbulence`, `check_sigmet_overlap` tools if it needs more detail
-6. Claude returns a structured JSON route recommendation + plain-language briefing
-7. Result is saved to PostgreSQL and returned to the client
-8. Frontend renders waypoints on the Leaflet map, overlays SIGMETs, and displays the briefing
+1. Operator picks a snapshot + disruption preset (e.g. *"Convective line over the Midwest, close HIGH_140–145"*).
+2. Backend builds trajectories + per-flight sector timelines (cached), aggregates a `FrameState` per timestep.
+3. UI loads sector polygons once, then scrubs/plays the timeline: flight dots move, sectors fill toward red, the storm overlay pulses.
+4. Disruption is injected → the timeline's conflict curve jumps; the **peak-conflict marker** shows the worst minute. The operator scrubs to it.
 
-### Flow 2: Alternative Route Request
+### Flow 2: AI co-pilot resolves it, one fix at a time
 
-1. User clicks "Show alternatives" on the result
-2. Frontend re-POSTs with `{"request_id": "...", "exclude_route": [...primary waypoints...]}`
-3. System reruns Claude with an instruction to avoid the primary route corridor
-4. Up to 2 alternatives are returned and rendered as secondary polylines on the map
+1. Operator clicks **"Ask the co-pilot."**
+2. Backend builds a compact world summary (top conflicts, the worst sectors and their biggest contributing flights) and calls **Claude with tool use**.
+3. Claude calls read tools (`list_conflicts`, `get_sector`, `get_flight`) then a what-if tool (`evaluate_reroute` / `evaluate_delay` / `evaluate_altitude`) to test a fix and see its measured impact **before** recommending it.
+4. Claude returns **one** mitigation with a rationale + impact numbers. UI shows it as a card with **Apply / Skip**.
+5. Operator clicks **Apply** → backend recomputes the affected flights, re-aggregates, the conflict curve drops, the sector recolors green. Loop back to step 1 for the next fix until the room is clear.
+
+### Flow 3: Compare outcomes
+
+1. **Reset** restores baseline-with-disruption.
+2. UI overlays the "do nothing" conflict curve vs. the "AI-managed" curve so judges see the delta in resolved conflicts and total added delay.
 
 ---
 
 ## 8. AI / Agent Design
 
-**Model:** `claude-sonnet-4-6`  
-**Prompting strategy:** System prompt establishes Claude as an expert aviation weather analyst + dispatcher. User turn provides structured weather context. Claude uses tool calls to fetch additional detail, then produces a JSON-structured route recommendation.
+**Model:** `claude-opus-4-8` (most capable for multi-constraint reasoning).
+**Pattern:** a bounded **tool-use loop** — Claude is the strategist, the backend owns ground
+truth. Claude never edits flights directly; it *evaluates* candidate fixes through tools and
+then recommends the single best one. This keeps every number on screen real and verifiable.
 
-### System Prompt (skeleton)
+### System prompt (skeleton)
+
 ```
-You are an expert aviation weather analyst and flight dispatcher with 20+ years of experience.
-Your job is to analyze weather data along candidate flight routes and recommend the safest,
-most efficient airway. Always prioritize safety over efficiency.
-Output a structured JSON route recommendation followed by a plain-language pilot briefing.
+You are the AI co-pilot in an air-traffic flow-management war room. A disruption has put
+sectors over capacity and pushed flights into weather. Your job: propose the SINGLE most
+valuable next mitigation to relieve the worst conflict, with the least delay and distance
+added, creating no new conflicts. Prefer rerouting/altitude for weather; ground holds for
+demand. Always evaluate a candidate with the what-if tools before recommending it. Return one
+mitigation with a crisp operational rationale.
 ```
 
-### Tools Claude Can Call
+### Tools Claude can call
 
-| Tool | Description |
-|------|-------------|
-| `get_metar(icao)` | Fetch live METAR for a station |
-| `get_sigmet_in_area(lat, lon, radius_nm)` | Get active SIGMETs near a point |
-| `get_winds_aloft(lat, lon, altitude_ft)` | Winds and temp at altitude |
-| `get_pireps_near(lat, lon, radius_nm)` | Recent pilot reports near a point |
-| `score_route_segment(waypoint_a, waypoint_b, altitude_ft)` | Aggregate hazard score for a segment |
+| Tool | Kind | Description |
+|------|------|-------------|
+| `list_conflicts(kind?, top_n?)` | read | Current conflicts ranked by severity |
+| `get_sector(name)` | read | Capacity, current load, biggest contributing flights, neighbors |
+| `get_flight(flight_id)` | read | Route, altitude, timing, which conflicts it's in |
+| `evaluate_reroute(flight_id, side, around)` | what-if | Simulated impact of a detour (no commit) |
+| `evaluate_delay(flight_id, minutes)` | what-if | Simulated impact of a ground hold (no commit) |
+| `evaluate_altitude(flight_id, new_alt_ft)` | what-if | Simulated impact of an altitude change (no commit) |
+| `recommend(mitigation, rationale)` | final | Emit the chosen mitigation back to the UI |
 
-### Prompt caching strategy
-- System prompt is cached (it's large and static per session)
-- Weather context is passed per-request (dynamic, not cached)
-- Estimated cache hit rate: ~60% on system prompt across a demo session
+### Prompt caching
 
-### Context window considerations
-- Weather data for a transcontinental route: ~4,000–8,000 tokens
-- Full context including system prompt: < 20,000 tokens — well within limits
-- If weather data exceeds 15k tokens, truncate PIREPs oldest-first
+- The system prompt + static world description (sector layout summary, rules) are sent as a
+  cached prefix (`cache_control`), so repeated "suggest" calls within a session hit the cache.
+- The dynamic conflict snapshot is appended uncached per call.
+- Expected: large cache-read fraction across a demo session of many suggestions.
+
+### Context-window notes
+
+- The world summary is deliberately compact (top-N conflicts + worst sectors), a few thousand
+  tokens — full sector/flight detail is fetched on demand via tools, not dumped into context.
+
+### Degraded mode
+
+- If `ANTHROPIC_API_KEY` is absent, `/copilot/suggest` falls back to the **deterministic
+  solver** (pick worst conflict → best-scoring what-if among reroute/delay/altitude) and a
+  templated rationale, so the demo never hard-fails.
 
 ---
 
-## 9. Infrastructure & Deployment
+## 9. Simulation Engine (technical core)
 
-**Environments:** `local` | `demo` (single server)  
-**CI/CD:** GitHub Actions — lint + test on PR  
-**Hosting:** Fly.io or Railway (free tier for demo)
+**Trajectory model** (per the data spec — constant cruise, no climb/descent):
+- Great-circle distance between consecutive waypoints → `cum_dist_nm`, `total_nm`.
+- At time `t`, fraction `f = (t - t0) / (t1 - t0)`; find the segment whose cumulative distance
+  brackets `f * total_nm`, linearly interpolate lat/lon within it. Outside `[t0, t1]` the
+  flight is on the ground / landed and excluded.
 
-### Docker Compose (local)
-```yaml
-services:
-  api:    # FastAPI app
-  db:     # PostgreSQL 16
-```
+**Sector occupancy** (precomputed once per flight, the key optimization):
+- Build a Shapely `STRtree` over each band's sector polygons.
+- Sample each flight's route at a fixed time step (e.g. 2 min), map each sample to its sector
+  via the tree, and collapse consecutive identical sectors into `SectorVisit(enter_t, exit_t)`.
+- Sector occupancy at time `t` = count of visits whose `[enter_t, exit_t]` contains `t`.
+  Aggregating all visits into per-sector interval lists makes any frame O(visits).
 
-### Environment Variables
+**Conflict detection** per frame:
+- `OVER_DEMAND`: `count > capacity` for a sector; severity = `count / capacity`.
+- `WEATHER`: flight position pixel has `refc >= 40 dBZ` **and** `retop >= cruise_alt_ft`
+  (per the weather spec) in the forecast valid at `t`.
+- `CLOSED_SECTOR`: flight is inside a sector marked closed by the disruption.
+
+**Mitigations** (what-if = recompute one flight, diff the conflict set):
+- `REROUTE`: insert detour waypoints offsetting the route laterally (N/S/E/W) around the
+  closed/storm cells; recompute distance → new timing (extra_nm, delay_min).
+- `DELAY`: shift `t0`/`t1` by the hold; the flight enters busy sectors later.
+- `ALTITUDE`: change `cruise_alt_ft` (and possibly band) to clear echo tops / move to a
+  less-loaded band.
+
+**Disruptions**:
+- `STORM`: threshold the refc grid (`>= 40 dBZ`) over the window → impacted region; flights at
+  or below local echo tops crossing it conflict.
+- `SECTOR_CLOSURE`: mark a set of sectors closed (often derived from the storm footprint).
+- `GROUND_STOP`: hold departures from an airport for a window.
+
+---
+
+## 10. Infrastructure & Deployment
+
+**Environments:** `local` (demo).
+**Run:** `./run.sh` → creates venv, installs `requirements.txt`, launches Uvicorn serving the
+API + the static `frontend/`. Open `http://localhost:8000`.
+
+### Environment variables
+
 | Variable | Purpose |
 |----------|---------|
-| `ANTHROPIC_API_KEY` | Claude API access |
-| `DATABASE_URL` | PostgreSQL connection string |
-| `AWC_API_KEY` | Aviation Weather Center (if required) |
-| `NOTAM_API_KEY` | FAA NOTAM API key |
+| `ANTHROPIC_API_KEY` | Claude co-pilot (optional — absent ⇒ deterministic fallback) |
+| `DATA_BUNDLE_DIR` | Path to `hackathon_data_bundle` (default: the Desktop bundle path) |
+| `CLAUDE_MODEL` | Override model id (default `claude-opus-4-8`) |
 | `LOG_LEVEL` | `INFO` / `DEBUG` |
 
 ---
 
-## 10. Security Considerations
+## 11. Security Considerations
 
-- [ ] All secrets in `.env`, never committed — `.env` in `.gitignore`
-- [ ] Input validation: ICAO codes validated against a known airport list
-- [ ] Claude responses validated against a Pydantic schema before use
-- [ ] Rate limit `/api/optimize` to 10 req/min per IP (to control Claude costs during demo)
-- [ ] No PII collected — no user accounts in MVP
-- [ ] CORS locked to demo frontend origin in production
-
----
-
-## 11. Open Questions
-
-| # | Question | Owner | Status |
-|---|----------|-------|--------|
-| 1 | Which waypoint graph to use for candidate routes? (FAA NAVAID database vs. OpenAIP) | Karthik | Open |
-| 2 | Does AWC free tier support the request volume we need during the demo? | teammate | Open |
-| 3 | Do we want a frontend framework (React) or keep it vanilla JS + Leaflet? | Both | Open |
-| 4 | Include oceanic waypoints (NAT tracks) for transatlantic demo routes? | Both | Open |
-| 5 | How do we handle airspace that requires ATC clearance (Class B/C)? Advisory disclaimer? | Karthik | Open |
+- [ ] `ANTHROPIC_API_KEY` only from env / `.env`; `.env` git-ignored, never committed.
+- [ ] Claude tool calls are validated against Pydantic schemas; unknown flight ids / out-of-range params rejected before touching the sim.
+- [ ] Claude can only call whitelisted, side-effect-free *evaluate* tools; the only state change is an explicit operator **Apply**.
+- [ ] Input validation on all API params (scenario id, timestamp bounds, flight id existence).
+- [ ] CORS limited to the local demo origin.
+- [ ] No PII — flight numbers and public route geometry only.
 
 ---
 
-## 12. Milestones
+## 12. Open Questions
+
+| # | Question | Status |
+|---|----------|--------|
+| 1 | Capacities are uniform-ish (min 20); do we scale them down so over-demand is visible at this traffic density, or pick the busiest snapshot/region? | Open |
+| 2 | Reroute waypoint synthesis: simple lateral offset vs. routing around the actual closed-sector polygons? | Open |
+| 3 | How many forecast strips to preload per scenario (memory vs. fidelity)? | Open |
+| 4 | Animate all ~16.7k dots or only airborne/en-route within the window for frame-rate? | Open |
+
+---
+
+## 13. Milestones
 
 | Milestone | Description | Target |
 |-----------|-------------|--------|
-| M1 | FastAPI skeleton + PostgreSQL schema + `/health` endpoint | Day 1 AM |
-| M2 | Weather fetcher working (METAR + SIGMET + winds-aloft) | Day 1 PM |
-| M3 | Claude integration — basic route scoring + briefing | Day 1 PM |
-| M4 | Frontend map (Leaflet) rendering waypoints + SIGMETs | Day 2 AM |
-| M5 | End-to-end demo: BOS→LAX optimized route on the map | Day 2 PM |
-| M6 | Polish: alternative routes, risk score UI, briefing panel | Day 2 PM |
+| M1 | Data loader + trajectory math + sector STRtree occupancy | Day 1 AM |
+| M2 | Conflict detection + per-timestep timeline; baseline "no disruption" sim | Day 1 PM |
+| M3 | Disruption injection (storm / sector closure / ground stop) + cascade visible | Day 1 PM |
+| M4 | Leaflet war-room UI: map dots, sector heatmap, storm overlay, scrubber, conflict feed | Day 2 AM |
+| M5 | Claude co-pilot tool-use loop + Apply/recompute; conflict curve drops live | Day 2 PM |
+| M6 | Polish: peak-conflict marker, do-nothing vs AI-managed overlay, scenario presets | Day 2 PM |
 
 ---
 
-## 13. File Structure (Planned)
+## 14. File Structure (planned)
 
 ```
 ASI_Hackathon/
 ├── backend/
-│   ├── main.py                  # FastAPI app entrypoint
-│   ├── routers/
-│   │   ├── optimize.py          # POST /api/optimize
-│   │   └── weather.py           # GET /api/weather/*
-│   ├── services/
-│   │   ├── route_optimizer.py   # Orchestrates the full flow
-│   │   ├── weather_fetcher.py   # Async AWC calls
-│   │   ├── route_generator.py   # Candidate waypoint corridors
-│   │   ├── airspace_checker.py  # NOTAM / TFR lookup
-│   │   └── claude_client.py     # Anthropic SDK wrapper + tools
-│   ├── models/
-│   │   ├── db.py                # SQLAlchemy models
-│   │   └── schemas.py           # Pydantic request/response schemas
-│   └── config.py                # pydantic-settings env config
+│   ├── main.py            # FastAPI app + static serving
+│   ├── config.py          # env / paths / model id
+│   ├── geo.py             # haversine, great-circle interpolation, grid pixel lookup
+│   ├── data_loader.py     # routes.json, sectors.geojson, wx .npz  (+ pickle cache)
+│   ├── simulation.py      # Trajectory, SectorVisit, FrameState, conflict detection
+│   ├── disruptions.py     # storm / sector closure / ground stop
+│   ├── mitigations.py     # reroute / delay / altitude what-if + apply
+│   ├── copilot.py         # Claude tool-use loop + deterministic fallback
+│   └── schemas.py         # Pydantic request/response models
 ├── frontend/
-│   ├── index.html
-│   ├── map.js                   # Leaflet map + route rendering
+│   ├── index.html         # war-room layout
+│   ├── app.js             # Leaflet map, scrubber, conflict feed, AI panel
 │   └── style.css
-├── docker-compose.yml
 ├── .env.example
 ├── requirements.txt
+├── run.sh
 └── SYSTEM_DESIGN.md
 ```
