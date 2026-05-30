@@ -34,10 +34,20 @@
     sectorsGeo(id) { return this._get(`/scenario/${id}/sectors.geojson`); }
     frame(id, t, band) { return this._get(`/scenario/${id}/frame?t=${encodeURIComponent(t)}&band=${band}`); }
     timeline(id, band) { return this._get(`/scenario/${id}/timeline?band=${band}`); }
-    disrupt(id, body, band) { return this._post(`/scenario/${id}/disrupt?band=${band}`, body); }
+    async disrupt(id, body, band) { return this._flatten(await this._post(`/scenario/${id}/disrupt?band=${band}`, body)); }
     suggest(id) { return this._post(`/scenario/${id}/copilot/suggest`, {}); }
-    apply(id, mitId, band) { return this._post(`/scenario/${id}/copilot/apply?band=${band}`, { mitigation_id: mitId }); }
-    reset(id, body, band) { return this._post(`/scenario/${id}/reset?band=${band}`, body); }
+    async apply(id, mitId, band) { return this._flatten(await this._post(`/scenario/${id}/copilot/apply?band=${band}`, { mitigation_id: mitId })); }
+    async reset(id, body, band) { return this._flatten(await this._post(`/scenario/${id}/reset?band=${band}`, body)); }
+
+    // The backend nests the timeline under `.timeline` and returns the storm as a
+    // polygon ring; the UI (and the mock) expect a flat timeline plus a disruption
+    // carrying the storm. Normalize here so both backends present one shape.
+    _flatten(res) {
+      const out = Object.assign({}, res.timeline || {}, res);
+      if (res.storm_polygon && res.disruption && res.disruption.kind === "STORM")
+        out.disruption = Object.assign({ polygon: res.storm_polygon }, res.disruption);
+      return out;
+    }
   }
 
   async function makeApi() {
@@ -170,14 +180,18 @@
 
   function drawStorm(disruption) {
     if (S.stormLayer) { S.map.removeLayer(S.stormLayer); S.stormLayer = null; }
-    if (!disruption || disruption.kind !== "STORM" || !disruption.storm) return;
-    const s = disruption.storm;
-    S.stormLayer = L.rectangle([[s.latMin, s.lonMin], [s.latMax, s.lonMax]], {
-      color: "#a855f7", weight: 1.5, fillColor: "#fb923c", fillOpacity: 0.18,
-      className: "storm-rect", interactive: false,
-    }).addTo(S.map);
-    S.stormLayer.bindTooltip("⛈ storm core · echo tops ~" + ((s.echoTopFt/1000)|0) + "kft",
-      { permanent: false, sticky: true });
+    if (!disruption || disruption.kind !== "STORM") return;
+    const style = { color: "#a855f7", weight: 1.5, fillColor: "#fb923c",
+                    fillOpacity: 0.18, className: "storm-rect", interactive: false };
+    let tip = "⛈ storm core";
+    if (disruption.polygon && disruption.polygon.length) {        // real backend: [lon,lat] ring
+      S.stormLayer = L.polygon(disruption.polygon.map(([lon, lat]) => [lat, lon]), style).addTo(S.map);
+    } else if (disruption.storm) {                                // mock: lon/lat bbox
+      const s = disruption.storm;
+      S.stormLayer = L.rectangle([[s.latMin, s.lonMin], [s.latMax, s.lonMax]], style).addTo(S.map);
+      tip += " · echo tops ~" + ((s.echoTopFt / 1000) | 0) + "kft";
+    } else return;
+    S.stormLayer.bindTooltip(tip, { permanent: false, sticky: true });
   }
 
   // ---------------------------------------------------------------------
