@@ -1,16 +1,18 @@
 # ASI Hackathon — System Design
 
-**Living Document:** [Google Doc](https://docs.google.com/document/d/1MlgbDywEloj09Aqc2POS3nQjshg0tGSJZAd6pdLOtlY/edit?tab=t.0)
-
+**Living Document:**  - 
+Backend - BACKEND_DESIGN.md
+Frontend  - FRONTEND_DESIGN.md
+System Design - SYSTEM_DESIGN.md
 ---
 
 ## 1. Project Overview
 
 > _What is this project? What problem does it solve? One paragraph._
 
-**Project Name:** <!-- TBD -->  
-**Team:** <!-- Names -->  
-**Goal:** <!-- High-level goal of the MVP -->
+**Project Name:**  ASI
+**Team:**   Dudley
+**Goal:** Win the Air Space Intelligence Hackathon
 
 ---
 

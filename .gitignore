@@ -5,6 +5,7 @@ hackathon_data_bundle/
 sectors.geojson
 routes.json
 routes.json.gz
+data
 
 # Python
 .venv/
