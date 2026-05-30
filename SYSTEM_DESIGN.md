@@ -404,16 +404,92 @@ API + the static `frontend/`. Open `http://localhost:8000`.
 
 ## 13. Milestones
 
+Each milestone ends with **both engineers pushing to `main`** so the other can `git pull` and immediately run `./run.sh` to see the working state. Commit convention: `M<N>: <short description>`.
 
-| Milestone | Description                                                                           | Target   |
-| --------- | ------------------------------------------------------------------------------------- | -------- |
-| M1        | Data loader + trajectory math + sector STRtree occupancy                              | Day 1 AM |
-| M2        | Conflict detection + per-timestep timeline; baseline "no disruption" sim              | Day 1 PM |
-| M3        | Disruption injection (storm / sector closure / ground stop) + cascade visible         | Day 1 PM |
-| M4        | Leaflet war-room UI: map dots, sector heatmap, storm overlay, scrubber, conflict feed | Day 2 AM |
-| M5        | Claude co-pilot tool-use loop + Apply/recompute; conflict curve drops live            | Day 2 PM |
-| M6        | Polish: peak-conflict marker, do-nothing vs AI-managed overlay, scenario presets      | Day 2 PM |
+---
 
+### M1 — "Hello Map" · Day 1 AM
+
+**App shows:** Dark war-room layout renders in the browser. Sector polygons are drawn on the Leaflet map (styled faint blue). The scenario dropdown is populated. The health chip in the header says the backend is up.
+
+
+| Engineer     | Delivers                                                                                                                                                  |
+| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Backend**  | `GET /health`, `GET /scenarios`, `POST /scenario/load`, `GET /sectors.geojson` · Data loader (routes + sectors) · STRtree built · Pickle cache scaffolded |
+| **Frontend** | War-room layout skeleton (`index.html` + `style.css`) · Leaflet map · Sector polygon layer · Scenario/disruption dropdowns populated from `/scenarios`    |
+
+
+**Git:** each pushes to `main`; other pulls and opens `http://localhost:8000`.
+
+---
+
+### M2 — "Flights Moving" · Day 1 AM → PM
+
+**App shows:** ~800 airborne flight dots drift along their routes as the scrubber plays. Each dot is cyan (ok). The timeline area chart draws total conflict counts (all zeros at baseline). Play/pause works.
+
+
+| Engineer     | Delivers                                                                                                                                              |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Backend**  | Trajectory engine (great-circle interpolation) · `GET /frame` · `GET /timeline` · Conflict detection (over-demand / weather / closed — 0 at baseline) |
+| **Frontend** | Flight dot layer (canvas renderer, reuse markers) · Timeline scrubber + play/pause · Frame-fetch loop (throttled) · Small area chart from `/timeline` |
+
+
+**Git:** push; pull; confirm dots are moving.
+
+---
+
+### M3 — "The Cascade" · Day 1 PM
+
+**App shows:** Inject *"Convective line over the Midwest"* → sectors bloom red on the map → storm overlay appears → conflict feed fills with 🔴/🟠/⛔ rows → timeline curve jumps → peak marker ▲ appears. Click the peak marker → scrubber jumps to the worst minute.
+
+
+| Engineer     | Delivers                                                                                                                                                                                                           |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Backend**  | Disruption engine (STORM, SECTOR_CLOSURE, GROUND_STOP) + 2–3 presets · `POST /disrupt` returns refreshed timeline · Frame state includes conflict status per flight and per sector                                 |
+| **Frontend** | Sector heatmap (ratio → color) · Storm overlay (translucent polygon) · Conflict feed (severity-sorted rows, click-to-highlight) · Status chips (over-demand count, weather flights) · Peak marker + click-to-scrub |
+
+
+**Git:** push; pull; run the preset disruption and watch the cascade.
+
+---
+
+### M4 — "AI Co-pilot Live" · Day 2 AM
+
+**App shows:** Click **"Ask the co-pilot"** → "analysing airspace…" spinner → suggestion card slides in (*"REROUTE AAL1234 north around HIGH_142 — clears 3 conflicts, +7 min"*). Click **Apply** → affected flight path shifts on map → sector recolors green → conflict curve drops → applied-fixes log updates.
+
+
+| Engineer     | Delivers                                                                                                                                                                                                           |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Backend**  | Claude tool-use loop (list_conflicts, get_sector, get_flight, evaluate_*, recommend) · `POST /copilot/suggest` · `POST /copilot/apply` (recomputes affected flights only) · Deterministic fallback when no API key |
+| **Frontend** | AI panel · Thinking state animation · Suggestion card (action icon, impact pills, rationale) · Apply / Skip buttons · Applied-fixes log                                                                            |
+
+
+**Git:** push; pull; run a full suggest → apply cycle; confirm conflict count drops.
+
+---
+
+### M5 — "War Room Complete" · Day 2 PM
+
+**App shows:** Reset button restores baseline-with-disruption. Timeline overlays **baseline** (faint) vs **AI-managed** (bright) curves so the delta is visible. Multiple prebuilt scenarios selectable. Works end-to-end without a Claude key (fallback solver + "offline solver" badge).
+
+
+| Engineer     | Delivers                                                                                                                                                                              |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Backend**  | `POST /reset` (keep/drop disruption) · Baseline timeline frozen at load · Scenario presets tuned for a dramatic cascade · Full API contract verified                                  |
+| **Frontend** | Dual timeline overlay (baseline vs current) · Reset flow · Scenario preset selector · `?mock=1` mock mode passes all paths · Visual polish (ops-center dark theme, smooth animations) |
+
+
+**Git:** push; pull; run the full demo flow from scratch; record a screen capture for judges.
+
+---
+
+### M6 — "Demo Polish" · Day 2 PM (stretch)
+
+**App shows:** Perfectly smooth demo: sector pulse animation, conflict number ticks down with each fix, clean typography, no flicker, fast warm-load (< 3 s), co-pilot suggestion in < 10 s.
+
+- Bug fixes and frame-rate tuning (canvas renderer, marker reuse)
+- Capacity scaling if over-demand is not dramatic enough (`CAPACITY_SCALE` env var)
+- README with one-command launch instructions
 
 ---
 
