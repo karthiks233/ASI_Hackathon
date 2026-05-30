@@ -448,7 +448,7 @@
     drawTimeline();
     $("disrupt-btn").disabled = false;
     $("reset-btn").disabled = false;
-    $("suggest-btn").disabled = true;
+    $("suggest-btn").disabled = false;   // baseline traffic is already congested — let the co-pilot work it
     $("play-btn").disabled = false;
     await setT(S.tStart);
     toast(`Loaded ${snapshotId} · ${res.flight_count.toLocaleString()} flights`);
