@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Flight Disruption War Room</title>
+
+  <!-- Leaflet -->
+  <link rel="stylesheet"
+        href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+        crossorigin="" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+          crossorigin=""></script>
+
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- ================= HEADER ================= -->
+    <header id="header">
+      <div class="brand">
+        <span class="logo">✈</span>
+        <div class="brand-text">
+          <div class="title">AI FLIGHT DISRUPTION <span class="accent">WAR ROOM</span></div>
+          <div class="subtitle">real-time air-traffic flow decision support</div>
+        </div>
+      </div>
+
+      <div class="controls">
+        <label class="ctl">
+          <span>Scenario</span>
+          <select id="scenario-select"></select>
+        </label>
+        <label class="ctl">
+          <span>Disruption</span>
+          <select id="disruption-select"><option value="">— none —</option></select>
+        </label>
+        <button id="disrupt-btn" class="btn btn-danger" disabled>Inject disruption</button>
+        <button id="reset-btn" class="btn btn-ghost" disabled>Reset</button>
+        <label class="ctl band-toggle">
+          <span>Band</span>
+          <div class="seg">
+            <button data-band="HIGH" class="seg-btn active">HIGH</button>
+            <button data-band="LOW" class="seg-btn">LOW</button>
+          </div>
+        </label>
+      </div>
+
+      <div class="status-chips" id="status-chips">
+        <div class="chip" id="chip-overdemand"><span class="dot red"></span><b>0</b> over-demand</div>
+        <div class="chip" id="chip-weather"><span class="dot orange"></span><b>0</b> in weather</div>
+        <div class="chip" id="chip-closed"><span class="dot redx"></span><b>0</b> blocked</div>
+        <div class="chip" id="chip-delay"><span class="clock">⏱</span><b>0</b> min delay</div>
+        <div class="chip" id="chip-ai"></div>
+      </div>
+    </header>
+
+    <!-- ================= BODY ================= -->
+    <main id="body">
+      <section id="map-wrap">
+        <div id="map"></div>
+        <div id="map-legend" class="legend">
+          <div class="legend-row"><span class="sw cyan"></span>nominal flight</div>
+          <div class="legend-row"><span class="sw orange"></span>in weather</div>
+          <div class="legend-row"><span class="sw red"></span>blocked / over-demand</div>
+          <div class="legend-sep"></div>
+          <div class="legend-row"><span class="sw sec-low"></span>sector &lt; capacity</div>
+          <div class="legend-row"><span class="sw sec-warn"></span>near capacity</div>
+          <div class="legend-row"><span class="sw sec-hot"></span>over capacity</div>
+        </div>
+        <div id="clock-badge" class="clock-badge">--:--Z</div>
+      </section>
+
+      <aside id="rail">
+        <!-- Conflict feed -->
+        <div class="panel">
+          <div class="panel-head">
+            <h3>Conflict feed</h3>
+            <span class="count-badge" id="conflict-count">0</span>
+          </div>
+          <div id="conflict-feed" class="feed">
+            <div class="empty">No active conflicts. Inject a disruption to begin.</div>
+          </div>
+        </div>
+
+        <!-- AI co-pilot -->
+        <div class="panel grow">
+          <div class="panel-head">
+            <h3>AI co-pilot</h3>
+            <span class="src-badge hidden" id="copilot-src"></span>
+          </div>
+          <button id="suggest-btn" class="btn btn-primary wide" disabled>Ask the co-pilot</button>
+          <div id="copilot-body" class="copilot-body">
+            <div class="empty">The co-pilot proposes one fix at a time once conflicts appear.</div>
+          </div>
+          <div class="applied-log" id="applied-log"></div>
+        </div>
+      </aside>
+    </main>
+
+    <!-- ================= TIMELINE ================= -->
+    <footer id="timeline">
+      <button id="play-btn" class="btn btn-round" disabled>▶</button>
+      <div class="timeline-track" id="timeline-track">
+        <canvas id="timeline-canvas"></canvas>
+        <div class="scrub-handle" id="scrub-handle"></div>
+        <div class="peak-marker hidden" id="peak-marker" title="Peak conflict — click to jump">▲</div>
+      </div>
+      <div class="timeline-meta">
+        <div class="legend-row tiny"><span class="line faint"></span>do nothing</div>
+        <div class="legend-row tiny"><span class="line bright"></span>AI-managed</div>
+        <div class="time-readout" id="time-readout">--:--Z</div>
+      </div>
+    </footer>
+
+    <div id="toast" class="toast hidden"></div>
+  </div>
+
+  <script src="mock.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
